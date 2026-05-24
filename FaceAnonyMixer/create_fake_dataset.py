@@ -71,7 +71,8 @@ def main():
 
     out_dir = osp.join(
         'datasets', 'fake',
-        f'fake_dataset_{args.gan}-{args.truncation}-{args.num_samples}{feat_tag}',
+        # f'fake_dataset_{args.gan}-{args.truncation}-{args.num_samples}{feat_tag}',
+        f'fake_dataset_{args.gan}',
     )
     if osp.exists(out_dir):
         shutil.rmtree(out_dir)

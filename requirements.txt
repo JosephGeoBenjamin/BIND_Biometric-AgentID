@@ -1,5 +1,3 @@
-# torch>=1.12.0
-# torchvision>=0.13.0
 numpy
 Pillow
 opencv-python-headless
@@ -18,4 +16,7 @@ ninja
 clip @ git+https://github.com/openai/CLIP.git
 face-alignment
 
+
+# torch>=1.12.0
+# torchvision>=0.13.0
 # mediapipe==0.10.14 # Only use this

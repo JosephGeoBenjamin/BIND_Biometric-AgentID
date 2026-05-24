@@ -25,11 +25,9 @@ DATASETS = {
     # 'sample_IJB-C': '/path/to/your/dataset',   # <-- UPDATE THIS
     # 'vggface2':    '/path/to/vggface2',
 
-    'celebahq': '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/CelebA-HQ-images/',
-    'celebahq-front': '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/CelebA-HQ-frontal',
-    # 'celebahq-front': '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/SubSet-for-test/',
-
-    "lfwa": '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/LFW-a-images/',
+    'celebahq':       '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CelebA-HQ-images/',
+    'celebahq-front': '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CelebA-HQ-frontal',
+    'celebahq-trial': '/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/SubSet-for-test/',
 }
 
 CelebA_classes = (
