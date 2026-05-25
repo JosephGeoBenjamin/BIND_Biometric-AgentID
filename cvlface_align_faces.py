@@ -29,7 +29,7 @@ from PIL import Image
 from torchvision.transforms import Compose, ToTensor, Normalize
 from cvlface_loader import load_aligner
 
-from lib.aligner import FaceAligner as FAM_FaceAligner
+# from FaceAnonyMixer.lib.aligner import FaceAligner as FAM_FaceAligner
 
 ##------------------------------------------------------------------------------
 

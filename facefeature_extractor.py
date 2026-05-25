@@ -25,10 +25,11 @@ from PIL import Image
 # from lib import DATASETS, FARL_PRETRAIN_MODEL, VGGFace2
 
 import cvlface_loader as cvlface
+import lafs_loader as lafs_fr
 
 
 DATASETS = {
-    "cfp" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/SubSet-for-test/"
+    "cfp-frontal" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/SubSet-for-test/"
 }
 
 class VGGFaceDataset(data.Dataset):
@@ -50,7 +51,7 @@ class VGGFaceDataset(data.Dataset):
                  transform=None):
         self.root_dir  = root_dir
         # self.train_dir = osp.join(root_dir, 'train')
-        self.train_dir = osp.join(root_dir, 'images')
+        self.train_dir = osp.join(root_dir, 'aligned')
 
         self.transform = transform or transforms.Compose([
             transforms.Resize((224, 224), antialias=True),
@@ -103,6 +104,8 @@ def parse_args():
 
     p.add_argument('--use-clip',            action='store_true')
     p.add_argument('--use-dino',            action='store_true')
+    p.add_argument('--use-lafs',            action='store_true')
+
     p.add_argument('--use-arcface-cvl',     action='store_true')
     p.add_argument('--use-adaface-cvl',     action='store_true')
     # p.add_argument('--no-vitkprpe-cvl',     action='store_true')
@@ -138,11 +141,11 @@ def main():
 
 
     # ── build models ──────────────────────────────────────────────────────────
-    clip_model   = dino_model = None
+    clip_model   = dino_model = lafs_model = None
     cvl_arcface_model  =  cvl_adaface_model  =  cvl_vitkprpe_model = None
 
 
-    if not args.use_clip:
+    if args.use_clip:
         clip_model, _ = clip.load('ViT-B/16', device=device, jit=False)
         clip_model.float().eval()
         clip_tf = transforms.Compose([
@@ -151,7 +154,7 @@ def main():
                                   (0.26862954, 0.26130258, 0.27577711)),
         ])
 
-    if not args.use_dino:
+    if args.use_dino:
         dino_model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
         dino_model.float().eval().to(device)
         dino_tf = transforms.Compose([
@@ -159,15 +162,21 @@ def main():
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
+    if args.use_lafs:
+        lafs_repo  = "pretrained/lafs_webface_finetune_withaugmentation.pth"
+        lafs_model = lafs_fr.load_lafs_model(lafs_repo).to(device)
+        lafs_model.float().eval().to(device)
+        lafs_tf    = lafs_fr.get_lafs_transform(input_size=112, tensorize=False)
+
 
     ## CVLface
-    if not args.use_arcface_cvl:
+    if args.use_arcface_cvl:
         cvl_arcface_repo  = "minchul/cvlface_arcface_ir101_webface4m"
         cvl_arcface_model = cvlface.load_cvlface_model(cvl_arcface_repo)
         cvl_arcface_model.float().eval().to(device)
         cvl_arcface_tf    = cvlface.get_cvlface_transform(input_size=112, tensorize=False)
 
-    if not args.use_adaface_cvl:
+    if args.use_adaface_cvl:
         cvl_adaface_repo  = "minchul/cvlface_adaface_ir101_webface4m"
         cvl_adaface_model = cvlface.load_cvlface_model(cvl_adaface_repo).to(device)
         cvl_adaface_model.float().eval().to(device)
@@ -190,6 +199,7 @@ def main():
     filenames     = []
     clip_feats    = []
     dino_feats    = []
+    lafs_feats    = []
 
     cvl_arcface_feats  = []
     cvl_adaface_feats  = []
@@ -208,6 +218,8 @@ def main():
                 clip_feats.append(clip_model.encode_image(clip_tf(imgs)).cpu())
             if dino_model:
                 dino_feats.append(dino_model(dino_tf(imgs)).cpu())
+            if lafs_model:
+                lafs_feats.append(lafs_model(lafs_tf(imgs)).cpu())
 
             if cvl_arcface_model:
                 cvl_arcface_feats.append(cvl_arcface_model(cvl_arcface_tf(imgs)).cpu())
@@ -231,6 +243,7 @@ def main():
 
     _save(clip_feats,    'clip_features.pt')
     _save(dino_feats,    'dino_features.pt')
+    _save(lafs_feats,    'lafs_features.pt')
 
     _save(cvl_arcface_feats,  'cvl_arcface_features.pt')
     _save(cvl_adaface_feats,  'cvl_adaface_features.pt')

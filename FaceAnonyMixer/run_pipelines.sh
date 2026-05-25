@@ -24,6 +24,8 @@ CUDA_VISIBLE_DEVICES=7 python create_fake_dataset.py \
     --cuda --verbose
 
 
+## Filter Generated face with Good Pose
+
 python lib/facepose.py  --inp "datasets/fake/fake_dataset_stylegan2_ffhq1024/*/*.jpg" \
                         --out datasets/fake/Fake_Filtered/
 
