@@ -21,6 +21,11 @@ from PIL import Image
 import sklearn.metrics as sk_metrics
 from natsort import natsorted
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+TQDM_lock = Lock()
+
+
 
 from turbocode import RSCEncoder, TurboEncoder, TurboDecoder, noiseless_llr, repeat_encode, repeat_decode
 
@@ -120,6 +125,46 @@ def percentile_binary_encode(vec: torch.Tensor, num_bits: int, coding="binary") 
 
     return encoded
 
+
+
+def compute_stddev_weightage(vec_vals):
+    # std over samples → (D,)
+    sdev = np.std(vec_vals, axis=0)
+
+    T = 0.001
+    x = sdev / T
+
+    # stability trick (important: subtract MIN, not MAX for softmin)
+    x = x - np.min(x)
+
+    # softmin = softmax(-x)
+    logits = -x
+
+    logits = logits - np.max(logits)   # stability for exp
+
+    exp_logits = np.exp(logits)
+
+    # prevent divide-by-zero
+    denom = np.sum(exp_logits)
+    if denom == 0:
+        r_weigh = np.ones_like(exp_logits) / len(exp_logits)
+    else:
+        r_weigh = exp_logits / denom
+
+    return r_weigh
+
+
+def compute_angular_align_weightage(vec_vals):
+    # std over samples → (D,)
+    numer = np.abs(np.sum(vec_vals, axis=0))
+    denom = np.sum(np.abs(vec_vals), axis=0)
+
+    angalg = numer / denom
+
+    r_weigh = np.power(angalg, 15.0)  # larger gamma sharpens
+    r_weigh = r_weigh / np.sum(r_weigh)
+
+    return r_weigh
 
 
 ##=====================  Utils  ================================================
@@ -401,6 +446,146 @@ class BiomBinder_RateControl():
 
 
 
+
+class BiomBinder_WTApure():
+    # poly_a=13, poly_b=15 are the standard LTE/3GPP generator polynomials (octal).
+    # num_iterations=6 is a common default for turbo decoding convergence.
+
+    def __init__(self, biom_size=300, msg_size=100):
+
+        if (biom_size//3) < msg_size:
+            raise ValueError("Not Compatible msg and biom size", msg_size, biom_size )
+
+        self.B = biom_size
+        self.M = msg_size
+        self.D = 512
+        self.actual_rate = 1.0 / 3
+
+        fb, ff = 0o23, 0o35
+
+        self.interleaver = np.random.permutation(self.M)
+        self.rsc         = RSCEncoder(g_feedback=fb, g_forward=ff)
+        self.encoder     = TurboEncoder(self.rsc, self.interleaver)
+        self.decoder     = TurboDecoder(self.rsc, self.interleaver, n_iter=8)
+
+        print(f"[BiomBinder lowrate] M={self.M}, "
+              f"rate=1/{3} ≈ {self.actual_rate:.4f}, "
+              f"transmitted bits per msg = {3 * self.M}")
+
+        self.biom_ref = None
+
+
+    def proc_to_bits(self, v, r_idx, r_vec=0):
+        v = v + r_vec
+        # v = v / np.linalg.norm(v)
+
+        y = (v[r_idx[1]] > v[r_idx[0]]).astype(np.int32)
+        return y
+
+    def generate_ridx(self, W):
+        ridx = np.random.choice(len(W), size=(2, self.B), replace=True, p=W)
+        return ridx
+
+    def generate_rvector(self, shape=(1, 512)):
+        rvec = 0.1 * np.random.rand(*shape)
+        return rvec
+
+    def feature_weight_per_user(self,  imgs_vecs):
+        vec_vals = np.stack(list(imgs_vecs), axis=0)
+
+        r_weigh = compute_angular_align_weightage(vec_vals)
+        return r_weigh
+
+    def compile_message(self, biom, msg):
+
+        sys, par1, par2 = self.encoder.encode(msg)
+        # print("Encoded", sys.shape, par1.shape, par2.shape)
+
+        j = self.M
+        sys_x  = np.bitwise_xor(sys,  biom[:j])
+        par1_x = np.bitwise_xor(par1, biom[j:2*j])
+        par2_x = np.bitwise_xor(par2, biom[2*j:3*j])
+
+        return (sys_x, par1_x, par2_x)
+
+
+    def extract_message(self, biom2, compiled_tuple):
+        sys, par1, par2 = compiled_tuple
+
+        j = self.M
+        sys_f  = np.bitwise_xor(sys,  biom2[:j])
+        par1_f = np.bitwise_xor(par1, biom2[j:2*j])
+        par2_f = np.bitwise_xor(par2, biom2[2*j:3*j])
+
+        sys_f  = noiseless_llr(sys_f, )
+        par1_f = noiseless_llr(par1_f )
+        par2_f = noiseless_llr(par2_f )
+
+        bits_hat = self.decoder.decode(sys_f, par1_f, par2_f)
+
+        return bits_hat
+
+
+    def genuine_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
+        scores = []
+
+        if TQDM_lock is not None: tqdm.set_lock(TQDM_lock)
+
+        for user_id, imgs in tqdm(biom_dict.items(), position=0, leave=True):
+            vecs = list(imgs.values())
+
+            if len(vecs) < 2: continue
+
+            W = self.feature_weight_per_user(vecs)
+            R_IDX = self.generate_ridx(W)  # (K, B)
+            R_VEC = self.generate_rvector(shape=(self.D,))
+
+            anchor = vecs[0]
+            anchor = self.proc_to_bits(anchor, R_IDX, R_VEC)
+
+            enc_tuple = self.compile_message(biom=anchor, msg=msg_bits)
+            for v in vecs[1:]:
+                v = self.proc_to_bits(v, R_IDX, R_VEC)
+                msg_bits_hat = self.extract_message(biom2=v, compiled_tuple=enc_tuple)
+                scr = sim_func(msg_bits, msg_bits_hat)
+                scores.append(scr)
+
+        return np.array(scores)
+
+
+    def imposter_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
+        scores = []
+        user_ids = list(biom_dict.keys())
+
+        # first vector per user
+        anchors = {u: list(biom_dict[u].values()) for u in user_ids if len(biom_dict[u]) > 0}
+
+        users = list(anchors.keys())
+
+        if TQDM_lock is not None: tqdm.set_lock(TQDM_lock)
+
+        for i in tqdm(range(len(users)),  position=1, leave=True):
+
+            W = self.feature_weight_per_user(anchors[users[i]])
+            R_IDX = self.generate_ridx(W)  # (K, B) # (K, B)
+            R_VEC = self.generate_rvector(shape=(self.D,))
+
+            anchor_en = self.proc_to_bits(anchors[users[i]][0], R_IDX, R_VEC)
+            enc_tuple = self.compile_message(biom=anchor_en, msg=msg_bits)
+            j = random.randrange(len(users))
+            if j==i: j=(j+1) % len(users)  # to make it not equal to i
+            anchor_comp = self.proc_to_bits(anchors[users[j]][0], R_IDX, R_VEC)
+            msg_bits_hat = self.extract_message(biom2=anchor_comp, compiled_tuple=enc_tuple)
+
+            scr = sim_func(msg_bits, msg_bits_hat)
+            scores.append(scr)
+
+        return np.array(scores)
+
+
+
+
+
 ##==============================================================================
 ##                           MAIN
 ##==============================================================================
@@ -444,46 +629,70 @@ def binding_debugger():
 
 if __name__ == "__main__":
 
-    ROOT_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/data_extracts/features_Anonym/celebahq-front/"
+    ROOT_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/data_extracts/face_features/cfp-frontal/"
 
-    SAVE_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/HYPES/ijcb_runs/base-R1-b512/"
+    SAVE_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/HYPES/trials/e1/"
     os.makedirs(SAVE_PATH, exist_ok=True)
 
     model_filter = {
     # "clip_features"    : "Clip Zero-Shot ViT-B",
     # "farl_features"    : "FARL Zero-Shot ViT-B",
-    # "cvl_arcface_features" : "ArcFace IR101",
-    # "cvl_adaface_features" : "AdaFace IR101",
+    "cvl_arcface_features" : "ArcFace IResNet-101",
+    "cvl_adaface_features" : "AdaFace IResNet-101",
     # "dino_features"        : "Dino Zero-shot",
-    "arcface_features"     : "IR50 Arc Face",
+    # "arcface_features"     : "IR50 Arc Face",
     }
+
     modelrep_dict = read_modelwise_biometrics(ROOT_PATH)
 
 
     repeat_rate = 1
     biom_enc_bits = 1
-    biom_size = 512
-    msg_size = biom_size // (repeat_rate*3)
+    biom_size = 256*3
+    msg_size = 256
 
-    binder = BiomBinder_RateControl(biom_size=biom_size, R=repeat_rate)
+    # binder = BiomBinder_RateControl(biom_size=biom_size, R=repeat_rate)
+
+    binder = BiomBinder_WTApure(biom_size=biom_size, msg_size=msg_size)
+
     msg_bits = np.random.randint(0, 2, size=msg_size, dtype=np.int32)
 
 
     msg_matching_dict = {}
     for fk in model_filter.keys():
         print(fk)
-        VEC_IN = percentile_binary_encode(modelrep_dict[fk][0], num_bits=biom_enc_bits, coding='binary')
+        VEC_IN = modelrep_dict[fk][0]
+        # VEC_IN = percentile_binary_encode(modelrep_dict[fk][0], num_bits=biom_enc_bits, coding='binary')
+
         vec , vec_dict = vectors_loader(os.path.join(ROOT_PATH, "image_filenames.txt"),
                             vectors=VEC_IN)
 
-        # #REMOVE : debug
-        # sample_keys = random.sample(list(vec_dict.keys()), min(6, len(vec_dict)))
-        # sub_dict = {k: vec_dict[k] for k in sample_keys}
-        # vec_dict = sub_dict
-        # #remove
+        #REMOVE : debug
+        sample_keys = random.sample(list(vec_dict.keys()), min(50, len(vec_dict)))
+        sub_dict = {k: vec_dict[k] for k in sample_keys}
+        vec_dict = sub_dict
+        #remove
 
-        msg_matching_dict[fk] = [binder.genuine_extraction(vec_dict, msg_bits, sim_func=hamming_error),
-                            binder.imposter_extraction(vec_dict, msg_bits, sim_func=hamming_error)]
+        ## # sequential
+        # genuine_arr  = binder.genuine_extraction(vec_dict, msg_bits, sim_func=hamming_error)
+        # imposter_arr = binder.imposter_extraction(vec_dict, msg_bits, sim_func=hamming_error)
+
+        ## # parallel
+        with ThreadPoolExecutor(3) as ex:
+
+            future_genuine = ex.submit(
+                binder.genuine_extraction, vec_dict, msg_bits, sim_func=hamming_error
+            )
+
+            future_imposter = ex.submit(
+                binder.imposter_extraction, vec_dict, msg_bits, sim_func=hamming_error
+            )
+
+            genuine_arr = future_genuine.result()
+            imposter_arr = future_imposter.result()
+
+
+        msg_matching_dict[fk] = [genuine_arr, imposter_arr]
 
 
 

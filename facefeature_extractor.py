@@ -29,7 +29,7 @@ import lafs_loader as lafs_fr
 
 
 DATASETS = {
-    "cfp-frontal" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/SubSet-for-test/"
+    "cfp-frontal" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CFP-frontal/"
 }
 
 class VGGFaceDataset(data.Dataset):
