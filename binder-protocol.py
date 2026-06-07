@@ -1,4 +1,5 @@
 import os, glob, sys
+import time
 import json
 import csv
 import itertools
@@ -6,51 +7,52 @@ from collections import defaultdict
 from tqdm import tqdm
 import pickle
 
+import math
+import random
 import pandas as pd
 import numpy as np
 import torch
-import math
-import random
+import torch.nn.functional as torch_F
+import sklearn.metrics as sk_metrics
+
+from PIL import Image
 import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import XKCD_COLORS, ListedColormap
-import matplotlib
 import matplotlib.patches as patches
-from PIL import Image
-import sklearn.metrics as sk_metrics
-from natsort import natsorted
 
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-TQDM_lock = Lock()
+from sionna.phy.fec.turbo import TurboEncoder, TurboDecoder
 
 
 
-from turbocode import RSCEncoder, TurboEncoder, TurboDecoder, noiseless_llr, repeat_encode, repeat_decode
 
 ##------------------------------------------------------------------------------
 
-def cosine_sim(a, b):
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-    return np.dot(a, b)
+def cosine_sim(a, b, dim=-1):
+    """
+    a, b: (..., D)
+    returns: (...,) cosine similarity along last dim
+    """
+    a = torch_F.normalize(a, dim=dim)
+    b = torch_F.normalize(b, dim=dim)
+    return (a * b).sum(dim=dim)
 
 
-def hamming_sim(a, b):
+def hamming_sim(a, b, dim=-1):
     """
-    Returns value in [0,1]
-    0 = identical, 1 = completely different
-    np.sum(a != b)  -> not normalised
+    Returns similarity in [0,1]
+    1 = identical, 0 = completely different
     """
-    return 1 - np.mean(a != b)
+    return (a == b).float().mean(dim=dim)
 
 
-def hamming_error(a, b):
+def hamming_error(a, b, dim=-1):
     """
-    np.sum(a != b)  -> not normalised
+    Returns number of differing elements along last dim
     """
-    return np.sum(a != b)
+    return (a != b).int().sum(dim=dim)
+
 
 
 def binary_encode_bits(bin_idx: torch.Tensor, num_bits: int) -> torch.Tensor:
@@ -90,86 +92,42 @@ def gray_encode_bits(bin_idx: torch.Tensor, num_bits: int) -> torch.Tensor:
 
 
 
-def percentile_binary_encode(vec: torch.Tensor, num_bits: int, coding="binary") -> torch.Tensor:
-    """
-    a: Tensor [N, D]
-    num_bits: number of bits (B)
-
-    Returns:
-        Tensor [N, D * B] with binary encoding (0/1 ints)
-    """
-    N, D = vec.shape
-    num_bins = 2 ** num_bits
-
-    # Step 1: compute thresholds (percentiles)
-    percentiles = torch.linspace(0, 100, steps=num_bins + 1, device=vec.device)[1:-1]
-    thresholds = torch.quantile(vec, percentiles / 100.0, dim=0)  # [num_bins-1, D]
-
-    # Step 2: assign bin indices
-    # bin_idx in [0, num_bins-1]
-    bin_idx = torch.zeros_like(vec, dtype=torch.long)
-
-    for i, t in enumerate(thresholds):
-        bin_idx += (vec > t).long()
-
-    # Step 3: convert bin index to binary (B bits) [N, D, B]
-    if coding == "gray":
-        encoded =  gray_encode_bits(bin_idx, num_bits)
-    elif coding == "binary":
-        encoded =  binary_encode_bits(bin_idx, num_bits)
-    elif coding == "bins":
-        encoded =  bin_idx
-
-    # Step 4: stack → [N, D, B] → reshape → [N, D*B]
-    encoded = encoded.reshape(N, D * num_bits)
-
-    return encoded
-
-
-
-def compute_stddev_weightage(vec_vals):
-    # std over samples → (D,)
-    sdev = np.std(vec_vals, axis=0)
-
-    T = 0.001
-    x = sdev / T
-
-    # stability trick (important: subtract MIN, not MAX for softmin)
-    x = x - np.min(x)
-
-    # softmin = softmax(-x)
-    logits = -x
-
-    logits = logits - np.max(logits)   # stability for exp
-
-    exp_logits = np.exp(logits)
-
-    # prevent divide-by-zero
-    denom = np.sum(exp_logits)
-    if denom == 0:
-        r_weigh = np.ones_like(exp_logits) / len(exp_logits)
-    else:
-        r_weigh = exp_logits / denom
-
-    return r_weigh
-
-
-def compute_angular_align_weightage(vec_vals):
-    # std over samples → (D,)
-    numer = np.abs(np.sum(vec_vals, axis=0))
-    denom = np.sum(np.abs(vec_vals), axis=0)
-
-    angalg = numer / denom
-
-    r_weigh = np.power(angalg, 15.0)  # larger gamma sharpens
-    r_weigh = r_weigh / np.sum(r_weigh)
-
-    return r_weigh
-
-
 ##=====================  Utils  ================================================
 
-def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4, title="", save_path=''):
+def tar_at_far(genuine, impostor, target_far):
+    """
+    TAR at a specific FAR.
+    """
+    y_true = np.concatenate([
+        np.ones(len(genuine)),
+        np.zeros(len(impostor))
+    ])
+
+    y_score = np.concatenate([genuine, impostor])
+
+    fpr, tpr, thresholds = sk_metrics.roc_curve(
+        y_true, y_score, drop_intermediate=False  # don't skip rare FAR points
+    )
+
+    # exact FAR=0 case
+    if target_far == 0:
+        valid = np.where(fpr == 0)[0]
+        if len(valid) == 0:
+            return 0.0, thresholds[-1]
+        idx = valid[np.argmax(tpr[valid])]
+        return tpr[idx], thresholds[idx]
+
+    # snap to closest FAR <= target (conservative, research-standard)
+    valid = np.where(fpr <= target_far)[0]
+    if len(valid) == 0:
+        return 0.0, thresholds[0]
+
+    idx = valid[np.argmax(tpr[valid])]
+    return tpr[idx], thresholds[idx]
+
+
+def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4,
+                        title="", save_path='', enable_roc_metrics=False):
     """
     score_dict: {
         "exp1": [genuine_array, impostor_array],
@@ -189,6 +147,7 @@ def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4, title="", sa
 
 
     for ax, (name, (genuine, impostor)) in zip(axes, score_dict.items()):
+        name,_,suff = name.partition("--")
 
         sns.histplot(genuine, bins=bins, stat="density", alpha=0.7,  edgecolor=None, ax=ax)
         sns.kdeplot(genuine, ax=ax, linewidth=2, label="Genuine KDE")
@@ -196,11 +155,26 @@ def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4, title="", sa
         sns.histplot(impostor, bins=bins, stat="density", alpha=0.7, edgecolor=None, ax=ax)
         sns.kdeplot(impostor, ax=ax, linewidth=2, label="Impostor KDE")
 
-        ax.set_title(model_filter[name])
-        ax.set_xlabel("Score")
+        ax.set_title(f"{model_filter[name]} {suff}")
         ax.set_ylabel("Density" if density else "Count")
         ax.legend()
         ax.grid(True)
+
+        xlabel = "score"
+        if enable_roc_metrics:
+            tar_far_0 , thrs_0   = tar_at_far(genuine, impostor, 0)
+            tar_far_1em6, thrs_1em6 = tar_at_far(genuine, impostor, 0.000001)
+            tar_far_0001, thrs_0001 = tar_at_far(genuine, impostor, 0.001)
+            tar_far_01, thrs_01   = tar_at_far(genuine, impostor, 0.1)
+
+            xlabel += (
+                f"\n{'TAR@FAR=0':<15}: {tar_far_0:.3f}  thresh: {thrs_0:.3f}"
+                f"\n{'TAR@FAR=1e-6':<15}: {tar_far_1em6:.3f}  thresh: {thrs_1em6:.3f}"
+                f"\n{'TAR@FAR=0.001':<15}: {tar_far_0001:.3f}  thresh: {thrs_0001:.3f}"
+                f"\n{'TAR@FAR=0.1':<15}: {tar_far_01:.3f}  thresh: {thrs_01:.3f}"
+            )
+
+        ax.set_xlabel(xlabel, fontfamily='monospace')
 
     # remove unused subplots
     for i in range(len(score_dict), len(axes)):
@@ -209,30 +183,30 @@ def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4, title="", sa
     plt.suptitle(f"Score Histogram {title}", fontsize=16, fontweight="bold")
     plt.tight_layout()
 
-    if not save_path: save_path = "binded-msg-recovery.png"
+    if not save_path: save_path = f"distribution-plot-{time.time()}.png"
     plt.savefig(save_path, dpi=300, bbox_inches="tight")  # save here
 
 
 
 
 
-def vectors_loader(txt_path, pt_path=None, vectors=None):
+def vectors_loader(txt_path, pt_path=None, vectors=None, device="cuda"):
 
     # load
     with open(txt_path, "r") as f:
         paths = [line.strip() for line in f]
 
     if vectors is None:
-        vectors = torch.load(pt_path)  # shape [N, D]
+        vectors = torch.load(pt_path).to(device)  # shape [N, D]
     else:
-        vectors = vectors
+        vectors = torch.tensor(vectors).to(device)
 
     # build dict
     vec_dic = defaultdict(dict)
 
     for i, p in enumerate(paths):
         user_id, img_name = p.split("/")  # adjust if deeper paths
-        vec_dic[user_id][img_name] = vectors[i].cpu().numpy()
+        vec_dic[user_id][img_name] = vectors[i].to(device)
 
     # convert to normal dict
     vec_dic = dict(vec_dic)
@@ -249,338 +223,211 @@ def vectors_loader(txt_path, pt_path=None, vectors=None):
 ##==============================================================================
 
 
-class BiomBinder_Naive():
-    # poly_a=13, poly_b=15 are the standard LTE/3GPP generator polynomials (octal).
-    # num_iterations=6 is a common default for turbo decoding convergence.
+class BiomBinder_IoMaxGRP():
 
-    def __init__(self, biom_size=522, msg_size=174):
-        self.N  = biom_size
-        self.M  = msg_size
-
-        fb, ff = 0o23, 0o35
-
-        self.interleaver = np.random.permutation(self.M)
-        self.rsc         = RSCEncoder(g_feedback=fb, g_forward=ff)
-        self.encoder     = TurboEncoder(self.rsc, self.interleaver)
-        self.decoder     = TurboDecoder(self.rsc, self.interleaver, n_iter=8)
-
-    def compile_message(self, biom, msg):
-        sys, par1, par2 = self.encoder.encode(msg)
-        # print("Encoded", sys.shape, par1.shape, par2.shape)
-
-        sys_x  = np.bitwise_xor(sys,  biom[:self.M])
-        par1_x = np.bitwise_xor(par1, biom[self.M:(self.M*2)])
-        par2_x = np.bitwise_xor(par2, biom[(self.M*2):(self.M*3)])
-
-        return (sys_x, par1_x, par2_x)
-
-    def extract_message(self, biom2, compiled_tuple):
-        sys, par1, par2 = compiled_tuple
-        sys_f  = np.bitwise_xor(sys,  biom2[:self.M])
-        par1_f = np.bitwise_xor(par1, biom2[self.M:(self.M*2)])
-        par2_f = np.bitwise_xor(par2, biom2[(self.M*2):(self.M*3)])
-
-        bits_hat = self.decoder.decode(
-                        noiseless_llr(sys_f,),
-                        noiseless_llr(par1_f,),
-                        noiseless_llr(par2_f,)
-                    )
-
-        return bits_hat
-
-
-    def genuine_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
-
-        for user_id, imgs in tqdm(biom_dict.items()):
-            vecs = list(imgs.values())
-
-            if len(vecs) < 2:
-                continue
-
-            anchor = vecs[0]
-            enc_tuple = self.compile_message(biom=anchor, msg=msg_bits)
-            for v in vecs[1:]:
-                msg_bits_hat = self.extract_message(biom2=v, compiled_tuple=enc_tuple)
-                scr = sim_func(msg_bits, msg_bits_hat)
-                scores.append(scr)
-
-
-        return np.array(scores)
-
-
-    def imposter_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
-        user_ids = list(biom_dict.keys())
-
-        # first vector per user
-        anchors = {u: list(biom_dict[u].values())[0] for u in user_ids if len(biom_dict[u]) > 0}
-
-        users = list(anchors.keys())
-        for i in tqdm(range(len(users))):
-            enc_tuple = self.compile_message(biom=anchors[users[i]], msg=msg_bits)
-            j = random.randrange(len(users)-1)
-            if j==i: j=j+1 # to make it not equal to i
-            msg_bits_hat = self.extract_message(biom2=anchors[users[j]], compiled_tuple=enc_tuple)
-
-            scr = sim_func(msg_bits, msg_bits_hat)
-            scores.append(scr)
-
-        return np.array(scores)
-
-
-
-class BiomBinder_RateControl():
-    # poly_a=13, poly_b=15 are the standard LTE/3GPP generator polynomials (octal).
-    # num_iterations=6 is a common default for turbo decoding convergence.
-
-    def __init__(self, biom_size=512, msg_size=None, R=3):
-
-        if not msg_size: msg_size = biom_size // (3*R)
-
-        if (biom_size//(3*R)) != msg_size:
-            raise ValueError("Not Compatible msg and biom size")
-
-        self.N  = biom_size
-        self.M  = msg_size
-        self.R = R
-        self.actual_rate = 1.0 / (3 * R)
-
-        fb, ff = 0o23, 0o35
-
-        self.interleaver = np.random.permutation(self.M)
-        self.rsc         = RSCEncoder(g_feedback=fb, g_forward=ff)
-        self.encoder     = TurboEncoder(self.rsc, self.interleaver)
-        self.decoder     = TurboDecoder(self.rsc, self.interleaver, n_iter=8)
-
-        print(f"[BiomBinder lowrate] N={self.N}, R={R}, "
-              f"rate=1/{3*R} ≈ {self.actual_rate:.4f}, "
-              f"transmitted bits per msg = {3 * self.M * R}, ",
-               f"Message bits = {self.M}" )
-
-
-    def compile_message(self, biom, msg):
-
-        sys, par1, par2 = self.encoder.encode(msg)
-        # print("Encoded", sys.shape, par1.shape, par2.shape)
-
-        sys_rep  =  repeat_encode(sys,  self.R)
-        par1_rep =  repeat_encode(par1, self.R)
-        par2_rep =  repeat_encode(par2, self.R)
-
-        biom_tiled = biom
-
-        j = self.M * self.R
-        sys_x  = np.bitwise_xor(sys_rep,  biom_tiled[:j])
-        par1_x = np.bitwise_xor(par1_rep, biom_tiled[j:2*j])
-        par2_x = np.bitwise_xor(par2_rep, biom_tiled[2*j:3*j])
-
-        return (sys_x, par1_x, par2_x)
-
-    def extract_message(self, biom2, compiled_tuple):
-        sys, par1, par2 = compiled_tuple
-
-        biom2_tiled = biom2
-
-        j = self.M * self.R
-        sys_f  = np.bitwise_xor(sys,  biom2_tiled[:j])
-        par1_f = np.bitwise_xor(par1, biom2_tiled[j:2*j])
-        par2_f = np.bitwise_xor(par2, biom2_tiled[2*j:3*j])
-
-        sys_f  = noiseless_llr(sys_f)
-        par1_f = noiseless_llr(par1_f)
-        par2_f = noiseless_llr(par2_f)
-
-        sys_rep  = repeat_decode(sys_f,  self.R)
-        par1_rep = repeat_decode(par1_f, self.R)
-        par2_rep = repeat_decode(par2_f, self.R)
-
-        bits_hat = self.decoder.decode(
-                        sys_rep,
-                        par1_rep,
-                        par2_rep,
-                    )
-
-        return bits_hat
-
-
-    def genuine_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
-
-        for user_id, imgs in tqdm(biom_dict.items()):
-            vecs = list(imgs.values())
-
-            if len(vecs) < 2:
-                continue
-
-            anchor = vecs[0]
-            enc_tuple = self.compile_message(biom=anchor, msg=msg_bits)
-            for v in vecs[1:]:
-                msg_bits_hat = self.extract_message(biom2=v, compiled_tuple=enc_tuple)
-                scr = sim_func(msg_bits, msg_bits_hat)
-                scores.append(scr)
-
-
-        return np.array(scores)
-
-
-    def imposter_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
-        user_ids = list(biom_dict.keys())
-
-        # first vector per user
-        anchors = {u: list(biom_dict[u].values())[0] for u in user_ids if len(biom_dict[u]) > 0}
-
-        users = list(anchors.keys())
-        for i in tqdm(range(len(users))):
-            enc_tuple = self.compile_message(biom=anchors[users[i]], msg=msg_bits)
-            for _ in range(2):
-                j = random.randrange(len(users))
-                if j==i: j=j+1 # to make it not equal to i
-                msg_bits_hat = self.extract_message(biom2=anchors[users[j]], compiled_tuple=enc_tuple)
-
-                scr = sim_func(msg_bits, msg_bits_hat)
-                scores.append(scr)
-
-        return np.array(scores)
-
-
-
-
-class BiomBinder_WTApure():
-    # poly_a=13, poly_b=15 are the standard LTE/3GPP generator polynomials (octal).
-    # num_iterations=6 is a common default for turbo decoding convergence.
-
-    def __init__(self, biom_size=300, msg_size=100):
+    def __init__(self, biom_size=300, msg_size=100, shared_cypher=True,
+                 device='cuda'):
 
         if (biom_size//3) < msg_size:
             raise ValueError("Not Compatible msg and biom size", msg_size, biom_size )
+        self.device = device
+        self.batch_max  = 1024
 
-        self.B = biom_size
         self.M = msg_size
+        self.B = msg_size * 3
         self.D = 512
         self.actual_rate = 1.0 / 3
 
-        fb, ff = 0o23, 0o35
+        self.shared_cypher = shared_cypher
 
-        self.interleaver = np.random.permutation(self.M)
-        self.rsc         = RSCEncoder(g_feedback=fb, g_forward=ff)
-        self.encoder     = TurboEncoder(self.rsc, self.interleaver)
-        self.decoder     = TurboDecoder(self.rsc, self.interleaver, n_iter=8)
+        self.encoder = TurboEncoder(
+            rate=1/3,              # 1/3 or 1/2 only
+            constraint_length=4,
+            terminate=False
+        )
+        self.decoder = TurboDecoder(
+            encoder=self.encoder,
+            num_iter=6,
+            hard_out=True
+        )
 
-        print(f"[BiomBinder lowrate] M={self.M}, "
+        print(f"[BiomBinder lowrate] Message={self.M}, "
               f"rate=1/{3} ≈ {self.actual_rate:.4f}, "
               f"transmitted bits per msg = {3 * self.M}")
 
         self.biom_ref = None
 
 
-    def proc_to_bits(self, v, r_idx, r_vec=0):
-        v = v + r_vec
-        # v = v / np.linalg.norm(v)
+    def generate_cypherkey(self, N_=1):
+        # (N, B, 2, D)
+        weight_m = torch.randn((N_, self.D, 2, self.B ))
+        # (N, D)
+        bias_v = 1.63*torch.randn((N_, 1, self.D))
 
-        y = (v[r_idx[1]] > v[r_idx[0]]).astype(np.int32)
-        return y
+        # (N, 2, B)
+        pert_i = torch.randint(self.B, (N_, 2, self.B))
 
-    def generate_ridx(self, W):
-        ridx = np.random.choice(len(W), size=(2, self.B), replace=True, p=W)
-        return ridx
+        return (weight_m.to(self.device),
+                bias_v.to(self.device),
+                pert_i.to(self.device))
 
-    def generate_rvector(self, shape=(1, 512)):
-        rvec = 0.1 * np.random.rand(*shape)
-        return rvec
 
-    def feature_weight_per_user(self,  imgs_vecs):
-        vec_vals = np.stack(list(imgs_vecs), axis=0)
+    def proc_to_bits(self, vecs_in, cypher, return_intermediate=False):
 
-        r_weigh = compute_angular_align_weightage(vec_vals)
-        return r_weigh
+        # (N, B, 2, D), (N, B), (N, 2, B)
+        Rweight, Rbias, Rpert = cypher
+
+        N, D = vecs_in.shape
+        N_   = Rweight.shape[0] # can be 1 or N
+        B    = self.B
+
+        x_bias = vecs_in + Rbias.view(N_, D)
+
+        # project: ---> (N, 2, B)
+        proj = (x_bias[:, None, :] @ Rweight.view(N_, D, 2*B)) # (N, 2B) matmul treats last 2-dim as matrix, rest are batch
+        proj = proj.view(N, 2, B) / math.sqrt(D)
+
+        # # binarize projection: (N, B)
+        # bits = (proj[:, 0, :] > proj[:, 1, :]).to(torch.int)
+
+        ## #perturb indices (N, 2, B), (N_, 2, P) --> (N, 2, P)
+        pert = torch.gather(proj, dim=-1, index=Rpert)
+
+        ## #binarize perturbated: (N, B)
+        bits = (pert[:, 0, :] > pert[:, 1, :])
+
+        ret_tuple = (bits.to(torch.int), )
+
+        if return_intermediate:
+            ret_tuple = ret_tuple + (x_bias.view(N, D), proj.view(N, 2, B))
+
+        return ret_tuple
+
+
 
     def compile_message(self, biom, msg):
 
-        sys, par1, par2 = self.encoder.encode(msg)
-        # print("Encoded", sys.shape, par1.shape, par2.shape)
+        encoded_msg = self.encoder(msg)
 
-        j = self.M
-        sys_x  = np.bitwise_xor(sys,  biom[:j])
-        par1_x = np.bitwise_xor(par1, biom[j:2*j])
-        par2_x = np.bitwise_xor(par2, biom[2*j:3*j])
+        hashed_msg = torch.logical_xor(encoded_msg, biom)
 
-        return (sys_x, par1_x, par2_x)
+        return hashed_msg
 
 
-    def extract_message(self, biom2, compiled_tuple):
-        sys, par1, par2 = compiled_tuple
+    def extract_message(self, biom2, hashed_msg):
 
-        j = self.M
-        sys_f  = np.bitwise_xor(sys,  biom2[:j])
-        par1_f = np.bitwise_xor(par1, biom2[j:2*j])
-        par2_f = np.bitwise_xor(par2, biom2[2*j:3*j])
+        encoded_hat = torch.logical_xor(hashed_msg, biom2)
 
-        sys_f  = noiseless_llr(sys_f, )
-        par1_f = noiseless_llr(par1_f )
-        par2_f = noiseless_llr(par2_f )
+        # Sionna convention: negative LLR = likely 0, positive LLR = likely 1
+        # bit=0 → signal +1 → LLR should be negative → -(+1) * scale
+        # bit=1 → signal -1 → LLR should be positive → -(-1) * scale
+        llr = -(1.0 - 2.0 * encoded_hat) * 10.0
 
-        bits_hat = self.decoder.decode(sys_f, par1_f, par2_f)
+        msg_hat     = self.decoder(llr)
 
-        return bits_hat
+        return msg_hat.to(torch.int)
 
 
-    def genuine_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
+    def genuine_extraction(self, biom_dict, msg_bits):
+        msg_scores = []
+        biom_scores = []
+        rbiom_scores = []
+        brbiom_scores = []; prbiom_scores = [];
 
-        if TQDM_lock is not None: tqdm.set_lock(TQDM_lock)
-
-        for user_id, imgs in tqdm(biom_dict.items(), position=0, leave=True):
+        for user_id, imgs in tqdm(biom_dict.items(), position=0):
             vecs = list(imgs.values())
-
             if len(vecs) < 2: continue
 
-            W = self.feature_weight_per_user(vecs)
-            R_IDX = self.generate_ridx(W)  # (K, B)
-            R_VEC = self.generate_rvector(shape=(self.D,))
 
-            anchor = vecs[0]
-            anchor = self.proc_to_bits(anchor, R_IDX, R_VEC)
+            vecs = torch.vstack(vecs).to(self.device)
 
-            enc_tuple = self.compile_message(biom=anchor, msg=msg_bits)
-            for v in vecs[1:]:
-                v = self.proc_to_bits(v, R_IDX, R_VEC)
-                msg_bits_hat = self.extract_message(biom2=v, compiled_tuple=enc_tuple)
-                scr = sim_func(msg_bits, msg_bits_hat)
-                scores.append(scr)
+            R_CYPER = self.generate_cypherkey(N_=1) # genuine cypher is same always
 
-        return np.array(scores)
+            anchor_vec = vecs[0:1]
+            anchor_bit, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
+                                                            return_intermediate=True)
+
+            others_vec = vecs[1:]
+            others_bit, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER,
+                                                            return_intermediate=True)
+
+
+            # start_time = time.time()
+            hashed_data = self.compile_message(biom=others_bit, msg=msg_bits)
+            msg_bits_hat = self.extract_message(biom2=anchor_bit, hashed_msg=hashed_data)
+            # print("Hash unhash Time", time.time()- start_time)
+
+            scr_m = hamming_error(msg_bits, msg_bits_hat)
+            msg_scores.extend(scr_m.cpu().tolist())
+
+            scr_b = hamming_sim(anchor_bit, others_bit)
+            biom_scores.extend(scr_b.cpu().tolist())
+
+            scr_r = cosine_sim(anchor_vec, others_vec)
+            rbiom_scores.extend(scr_r.cpu().tolist())
+
+            scr_br = cosine_sim(anc_bias, oth_bias)
+            brbiom_scores.extend(scr_br.cpu().tolist())
+
+            scr_pr = cosine_sim(anc_proj, oth_proj).view(-1)
+            prbiom_scores.extend(scr_pr.cpu().tolist())
+
+        return msg_scores, biom_scores, rbiom_scores, brbiom_scores, prbiom_scores
 
 
     def imposter_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
-        scores = []
-        user_ids = list(biom_dict.keys())
+        msg_scores = []
+        biom_scores = []
+        rbiom_scores = []
+        brbiom_scores = []; prbiom_scores = [];
 
-        # first vector per user
-        anchors = {u: list(biom_dict[u].values()) for u in user_ids if len(biom_dict[u]) > 0}
+        max_v = 10
 
-        users = list(anchors.keys())
+        # first max_v vector per user
+        filtered_dict = {u: torch.vstack(
+                            list(biom_dict[u].values())[:max_v]
+                                ).to(self.device)
+                            for u in biom_dict.keys()
+                                if len(biom_dict[u]) > 0}
 
-        if TQDM_lock is not None: tqdm.set_lock(TQDM_lock)
+        user_ids = list(filtered_dict.keys())
 
-        for i in tqdm(range(len(users)),  position=1, leave=True):
 
-            W = self.feature_weight_per_user(anchors[users[i]])
-            R_IDX = self.generate_ridx(W)  # (K, B) # (K, B)
-            R_VEC = self.generate_rvector(shape=(self.D,))
+        for ref_user in tqdm(user_ids):
 
-            anchor_en = self.proc_to_bits(anchors[users[i]][0], R_IDX, R_VEC)
-            enc_tuple = self.compile_message(biom=anchor_en, msg=msg_bits)
-            j = random.randrange(len(users))
-            if j==i: j=(j+1) % len(users)  # to make it not equal to i
-            anchor_comp = self.proc_to_bits(anchors[users[j]][0], R_IDX, R_VEC)
-            msg_bits_hat = self.extract_message(biom2=anchor_comp, compiled_tuple=enc_tuple)
+            R_CYPER = self.generate_cypherkey(N_=1)
 
-            scr = sim_func(msg_bits, msg_bits_hat)
-            scores.append(scr)
+            anchor_vec = filtered_dict[ref_user][0:1]
+            anchor_bit, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
+                                                    return_intermediate=True)
 
-        return np.array(scores)
+
+            R_CYPER_O = R_CYPER
+
+            others_vec = torch.vstack([v for u, v in filtered_dict.items()
+                                        if u != ref_user])
+            others_bit, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER_O,
+                                                            return_intermediate=True)
+
+            hashed_data = self.compile_message(biom=others_bit, msg=msg_bits)
+            msg_bits_hat = self.extract_message(biom2=anchor_bit, hashed_msg=hashed_data)
+
+            scr_m = hamming_error(msg_bits, msg_bits_hat)
+            msg_scores.extend(scr_m.cpu().tolist())
+
+            scr_b = hamming_sim(anchor_bit, others_bit)
+            biom_scores.extend(scr_b.cpu().tolist())
+
+            scr_r = cosine_sim(anchor_vec, others_vec)
+            rbiom_scores.extend(scr_r.cpu().tolist())
+
+            scr_br = cosine_sim(anc_bias, oth_bias)
+            brbiom_scores.extend(scr_br.cpu().tolist())
+
+            scr_pr = cosine_sim(anc_proj, oth_proj).view(-1)
+            prbiom_scores.extend(scr_pr.cpu().tolist())
+
+        return msg_scores, biom_scores, rbiom_scores, brbiom_scores, prbiom_scores
 
 
 
@@ -590,7 +437,7 @@ class BiomBinder_WTApure():
 ##                           MAIN
 ##==============================================================================
 
-def read_modelwise_biometrics(root_path):
+def read_modelwise_biometrics(root_path, device_mapping='cuda'):
     feature_files = glob.glob(f"{root_path}/*.pt", recursive=True)
     modelrep_dict = {}
 
@@ -600,7 +447,7 @@ def read_modelwise_biometrics(root_path):
         if ff_name not in model_filter.keys(): continue
 
         vec , vec_dict = vectors_loader(os.path.join(root_path, "image_filenames.txt"),
-                            ff)
+                            ff, device=device_mapping)
         modelrep_dict[ff_name] = [vec, vec_dict]
 
         print(ff_name)
@@ -612,7 +459,7 @@ def binding_debugger():
 
     biom_size = 512
     msg_size = biom_size // 3
-    binder = BiomBinder_RateControl(biom_size=biom_size, msg_size=msg_size)
+    binder = BiomBinder_IoMaxGRP(biom_size=biom_size, msg_size=msg_size)
 
     bits = np.random.randint(0, 2, size=msg_size, dtype=np.int32)
     biom = np.random.randint(0, 2, size=biom_size, dtype=np.int32)
@@ -628,79 +475,82 @@ def binding_debugger():
 
 
 if __name__ == "__main__":
+    DEVICE = 'cuda'
 
     ROOT_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/data_extracts/face_features/cfp-frontal/"
 
-    SAVE_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/HYPES/trials/e1/"
+    SAVE_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/HYPES/trials/e2/"
     os.makedirs(SAVE_PATH, exist_ok=True)
+
 
     model_filter = {
     # "clip_features"    : "Clip Zero-Shot ViT-B",
     # "farl_features"    : "FARL Zero-Shot ViT-B",
-    "cvl_arcface_features" : "ArcFace IResNet-101",
+    # "cvl_arcface_features" : "ArcFace IResNet-101",
     "cvl_adaface_features" : "AdaFace IResNet-101",
     # "dino_features"        : "Dino Zero-shot",
     # "arcface_features"     : "IR50 Arc Face",
     }
 
-    modelrep_dict = read_modelwise_biometrics(ROOT_PATH)
+    modelrep_dict = read_modelwise_biometrics(ROOT_PATH, DEVICE)
 
 
     repeat_rate = 1
     biom_enc_bits = 1
-    biom_size = 256*3
-    msg_size = 256
+    msg_size = 2048
+    biom_size = msg_size*3
 
-    # binder = BiomBinder_RateControl(biom_size=biom_size, R=repeat_rate)
+    binder = BiomBinder_IoMaxGRP(biom_size=biom_size, msg_size=msg_size, device=DEVICE)
 
-    binder = BiomBinder_WTApure(biom_size=biom_size, msg_size=msg_size)
-
-    msg_bits = np.random.randint(0, 2, size=msg_size, dtype=np.int32)
+    msg_bits = torch.randint(0, 2, (msg_size,), dtype=torch.int).to(DEVICE)
 
 
     msg_matching_dict = {}
+    rbiom_matching_dict = {}
+
     for fk in model_filter.keys():
         print(fk)
+        vec_dict = modelrep_dict[fk][1]
+
         VEC_IN = modelrep_dict[fk][0]
-        # VEC_IN = percentile_binary_encode(modelrep_dict[fk][0], num_bits=biom_enc_bits, coding='binary')
 
         vec , vec_dict = vectors_loader(os.path.join(ROOT_PATH, "image_filenames.txt"),
                             vectors=VEC_IN)
 
-        #REMOVE : debug
-        sample_keys = random.sample(list(vec_dict.keys()), min(50, len(vec_dict)))
-        sub_dict = {k: vec_dict[k] for k in sample_keys}
-        vec_dict = sub_dict
-        #remove
+        # ### REMOVE : debug
+        # sample_keys = random.sample(list(vec_dict.keys()), min(10, len(vec_dict)))
+        # sub_dict = {k: vec_dict[k] for k in sample_keys}
+        # vec_dict = sub_dict
+        # #### remove
 
-        ## # sequential
-        # genuine_arr  = binder.genuine_extraction(vec_dict, msg_bits, sim_func=hamming_error)
-        # imposter_arr = binder.imposter_extraction(vec_dict, msg_bits, sim_func=hamming_error)
+        ## sequential computation
+        (gen_msg_err, gen_biom_sim, gen_rbiom_sim, gen_brbiom_sim, gen_prbiom_sim
+                            ) = binder.genuine_extraction(vec_dict, msg_bits)
+        (imp_msg_err, imp_biom_sim, imp_rbiom_sim, imp_brbiom_sim, imp_prbiom_sim
+                            ) = binder.imposter_extraction(vec_dict, msg_bits)
 
-        ## # parallel
-        with ThreadPoolExecutor(3) as ex:
+        ## store stuff
+        msg_matching_dict[fk] = [gen_msg_err, imp_msg_err]
 
-            future_genuine = ex.submit(
-                binder.genuine_extraction, vec_dict, msg_bits, sim_func=hamming_error
-            )
-
-            future_imposter = ex.submit(
-                binder.imposter_extraction, vec_dict, msg_bits, sim_func=hamming_error
-            )
-
-            genuine_arr = future_genuine.result()
-            imposter_arr = future_imposter.result()
+        rbiom_matching_dict[f"{fk}--raw"] = [gen_rbiom_sim, imp_rbiom_sim]
+        rbiom_matching_dict[f"{fk}--bias"] = [gen_brbiom_sim, imp_brbiom_sim]
+        rbiom_matching_dict[f"{fk}--proj"] = [gen_prbiom_sim, imp_prbiom_sim]
+        rbiom_matching_dict[f"{fk}--binary"] = [gen_biom_sim, imp_biom_sim]
 
 
-        msg_matching_dict[fk] = [genuine_arr, imposter_arr]
+        dump_dict = {fk: msg_matching_dict[fk]}
+        with open(os.path.join(SAVE_PATH, f"{fk}-message_match_error_sum.pkl"), "wb") as f:
+            pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        dump_dict = {k:v for k,v in rbiom_matching_dict.items() if fk in k}
+        with open(os.path.join(SAVE_PATH, f"{fk}-biom_analysis.pkl"), "wb") as f:
+            pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # with open("data.pkl", "rb") as f: loaded_from_disk = pickle.load(f)
 
 
+        plot_score_hist_grid(msg_matching_dict, title = f"Retrived Message Error", cols=1,
+                save_path=os.path.join(SAVE_PATH,"binded-msg-recovery-sum.png"))
 
-    with open(os.path.join(SAVE_PATH, "message_match_hist_sum.pkl"), "wb") as f:
-        pickle.dump(msg_matching_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
-    # with open("data.pkl", "rb") as f: loaded_from_disk = pickle.load(f)
-
-
-    plot_score_hist_grid(msg_matching_dict, title = f"Retrived Message Error", cols=1,
-            save_path=os.path.join(SAVE_PATH,"binded-msg-recovery-sum.png"))
-
+        plot_score_hist_grid(rbiom_matching_dict, title = f"Biometrics Similarity for Step-Wise", cols=4,
+            save_path=os.path.join(SAVE_PATH,"biometric-similarities.png"))
