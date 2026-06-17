@@ -127,7 +127,8 @@ def tar_at_far(genuine, impostor, target_far):
 
 
 def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4,
-                        title="", save_path='', enable_roc_metrics=False):
+                        title="", save_path='',
+                        enable_roc_metrics=False, enable_err_metrics=False):
     """
     score_dict: {
         "exp1": [genuine_array, impostor_array],
@@ -149,6 +150,9 @@ def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4,
     for ax, (name, (genuine, impostor)) in zip(axes, score_dict.items()):
         name,_,suff = name.partition("--")
 
+        genuine  = np.asarray(genuine)
+        impostor = np.asarray(impostor)
+
         sns.histplot(genuine, bins=bins, stat="density", alpha=0.7,  edgecolor=None, ax=ax)
         sns.kdeplot(genuine, ax=ax, linewidth=2, label="Genuine KDE")
 
@@ -166,13 +170,21 @@ def plot_score_hist_grid(score_dict, bins=50, density=True, cols=4,
             tar_far_1em6, thrs_1em6 = tar_at_far(genuine, impostor, 0.000001)
             tar_far_0001, thrs_0001 = tar_at_far(genuine, impostor, 0.001)
             tar_far_01, thrs_01   = tar_at_far(genuine, impostor, 0.1)
-
             xlabel += (
                 f"\n{'TAR@FAR=0':<15}: {tar_far_0:.3f}  thresh: {thrs_0:.3f}"
                 f"\n{'TAR@FAR=1e-6':<15}: {tar_far_1em6:.3f}  thresh: {thrs_1em6:.3f}"
                 f"\n{'TAR@FAR=0.001':<15}: {tar_far_0001:.3f}  thresh: {thrs_0001:.3f}"
                 f"\n{'TAR@FAR=0.1':<15}: {tar_far_01:.3f}  thresh: {thrs_01:.3f}"
             )
+
+        if enable_err_metrics:
+            tar_err =100* len(genuine[genuine==0])/len(genuine)
+            frr_err =100* len(genuine[genuine!=0])/len(genuine)
+            far_err =100* len(impostor[impostor==0])/len(impostor)
+            xlabel += (
+                f"\nTAR={tar_err:.1f}% | FRR={frr_err:.1f}% | FAR={far_err:.1f}%"
+            )
+
 
         ax.set_xlabel(xlabel, fontfamily='monospace')
 
@@ -223,25 +235,34 @@ def vectors_loader(txt_path, pt_path=None, vectors=None, device="cuda"):
 ##==============================================================================
 
 
-class BiomBinder_IoMaxGRP():
+class BiomBinder_Method():
 
-    def __init__(self, biom_size=300, msg_size=100, shared_cypher=True,
-                 device='cuda'):
+    def __init__( self, biom_bit_size=300, msg_bit_size=100,
+                lmbda=0.0, rate_denom = 3,
+                shared_cypher=True,
+                genuine_1VSrest = False,
+                genuine_max  = 10,
+                imposter_max = 10,
+                device='cuda'):
 
-        if (biom_size//3) < msg_size:
-            raise ValueError("Not Compatible msg and biom size", msg_size, biom_size )
+        if (biom_bit_size//rate_denom) != msg_bit_size:
+            raise ValueError("Not Compatible msg and biom size", msg_bit_size, biom_bit_size )
         self.device = device
         self.batch_max  = 1024
 
-        self.M = msg_size
-        self.B = msg_size * 3
+        self.M = msg_bit_size
+        self.B = biom_bit_size
         self.D = 512
-        self.actual_rate = 1.0 / 3
+        self.lmbda = lmbda
 
+        self.actual_rate = 1.0 / rate_denom
+        self.max_tnsr_capacity = 50 # chose
         self.shared_cypher = shared_cypher
+        self.gen_1vsrest  = genuine_1VSrest
+        self.imposter_max = imposter_max
 
         self.encoder = TurboEncoder(
-            rate=1/3,              # 1/3 or 1/2 only
+            rate=1/rate_denom,              # 1/3 or 1/2 only
             constraint_length=4,
             terminate=False
         )
@@ -252,8 +273,8 @@ class BiomBinder_IoMaxGRP():
         )
 
         print(f"[BiomBinder lowrate] Message={self.M}, "
-              f"rate=1/{3} ≈ {self.actual_rate:.4f}, "
-              f"transmitted bits per msg = {3 * self.M}")
+              f"rate=1/{rate_denom} ≈ {self.actual_rate:.4f}, "
+              f"transmitted bits per msg = {biom_bit_size}")
 
         self.biom_ref = None
 
@@ -262,7 +283,7 @@ class BiomBinder_IoMaxGRP():
         # (N, B, 2, D)
         weight_m = torch.randn((N_, self.D, 2, self.B ))
         # (N, D)
-        bias_v = 1.63*torch.randn((N_, 1, self.D))
+        bias_v = self.lmbda*torch.randn((N_, 1, self.D))
 
         # (N, 2, B)
         pert_i = torch.randint(self.B, (N_, 2, self.B))
@@ -270,6 +291,10 @@ class BiomBinder_IoMaxGRP():
         return (weight_m.to(self.device),
                 bias_v.to(self.device),
                 pert_i.to(self.device))
+
+    def embedding_norm(self, vecs_in):
+        vecs_out = math.sqrt(512) * vecs_in / vecs_in.norm(dim=1, keepdim=True)
+        return vecs_out
 
 
     def proc_to_bits(self, vecs_in, cypher, return_intermediate=False):
@@ -281,7 +306,9 @@ class BiomBinder_IoMaxGRP():
         N_   = Rweight.shape[0] # can be 1 or N
         B    = self.B
 
-        x_bias = vecs_in + Rbias.view(N_, D)
+        x_norm = self.embedding_norm(vecs_in)
+
+        x_bias = x_norm + Rbias.view(N_, D)
 
         # project: ---> (N, 2, B)
         proj = (x_bias[:, None, :] @ Rweight.view(N_, D, 2*B)) # (N, 2B) matmul treats last 2-dim as matrix, rest are batch
@@ -299,7 +326,7 @@ class BiomBinder_IoMaxGRP():
         ret_tuple = (bits.to(torch.int), )
 
         if return_intermediate:
-            ret_tuple = ret_tuple + (x_bias.view(N, D), proj.view(N, 2, B))
+            ret_tuple = ret_tuple + (x_norm.view(N,D), x_bias.view(N, D), proj.view(N, 2, B))
 
         return ret_tuple
 
@@ -330,9 +357,9 @@ class BiomBinder_IoMaxGRP():
 
     def genuine_extraction(self, biom_dict, msg_bits):
         msg_scores = []
-        biom_scores = []
-        rbiom_scores = []
-        brbiom_scores = []; prbiom_scores = [];
+        biom_scores = []; rbiom_scores = []
+        nrbiom_scores = []; brbiom_scores = []; prbiom_scores = []
+
 
         for user_id, imgs in tqdm(biom_dict.items(), position=0):
             vecs = list(imgs.values())
@@ -343,14 +370,27 @@ class BiomBinder_IoMaxGRP():
 
             R_CYPER = self.generate_cypherkey(N_=1) # genuine cypher is same always
 
-            anchor_vec = vecs[0:1]
-            anchor_bit, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
-                                                            return_intermediate=True)
+            ## prevent memory explosion
+            safety_trigger = False
+            if len(vecs) > self.max_tnsr_capacity:
+                safety_trigger = True
+                print("Tnsr Max Safety trigger")
 
-            others_vec = vecs[1:]
-            others_bit, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER,
-                                                            return_intermediate=True)
+            if self.gen_1vsrest or safety_trigger: # 1 to rest
+                anchor_vec = vecs[0:1]
+                others_vec = vecs[1:]
+            else: # all to all
+                n_ = vecs.shape[0]
+                i_idx, j_idx = torch.triu_indices(n_, n_, offset=1)  # offset=1 skips diagonal
 
+                anchor_vec = vecs[i_idx]  # shape (N*(N-1)/2, D)
+                others_vec = vecs[j_idx]  # shape (N*(N-1)/2, D)
+
+
+            anchor_bit, anc_norm, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
+                                                            return_intermediate=True)
+            others_bit, oth_norm, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER,
+                                                            return_intermediate=True)
 
             # start_time = time.time()
             hashed_data = self.compile_message(biom=others_bit, msg=msg_bits)
@@ -366,22 +406,24 @@ class BiomBinder_IoMaxGRP():
             scr_r = cosine_sim(anchor_vec, others_vec)
             rbiom_scores.extend(scr_r.cpu().tolist())
 
+            scr_nr = cosine_sim(anc_norm, oth_norm)
+            nrbiom_scores.extend(scr_nr.cpu().tolist())
+
             scr_br = cosine_sim(anc_bias, oth_bias)
             brbiom_scores.extend(scr_br.cpu().tolist())
 
             scr_pr = cosine_sim(anc_proj, oth_proj).view(-1)
             prbiom_scores.extend(scr_pr.cpu().tolist())
 
-        return msg_scores, biom_scores, rbiom_scores, brbiom_scores, prbiom_scores
+        return msg_scores, biom_scores, rbiom_scores, nrbiom_scores, brbiom_scores, prbiom_scores
 
 
-    def imposter_extraction(self, biom_dict, msg_bits, sim_func=np.dot):
+    def imposter_extraction(self, biom_dict, msg_bits):
         msg_scores = []
-        biom_scores = []
-        rbiom_scores = []
-        brbiom_scores = []; prbiom_scores = [];
+        biom_scores = []; rbiom_scores = []
+        nrbiom_scores = []; brbiom_scores = []; prbiom_scores = []
 
-        max_v = 10
+        max_v = self.imposter_max
 
         # first max_v vector per user
         filtered_dict = {u: torch.vstack(
@@ -397,16 +439,16 @@ class BiomBinder_IoMaxGRP():
 
             R_CYPER = self.generate_cypherkey(N_=1)
 
-            anchor_vec = filtered_dict[ref_user][0:1]
-            anchor_bit, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
-                                                    return_intermediate=True)
-
-
             R_CYPER_O = R_CYPER
 
+            anchor_vec = filtered_dict[ref_user][0:1]
+
             others_vec = torch.vstack([v for u, v in filtered_dict.items()
-                                        if u != ref_user])
-            others_bit, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER_O,
+                            if u != ref_user])
+
+            anchor_bit, anc_norm, anc_bias, anc_proj = self.proc_to_bits(anchor_vec, R_CYPER,
+                                                    return_intermediate=True)
+            others_bit, oth_norm, oth_bias, oth_proj = self.proc_to_bits(others_vec, R_CYPER_O,
                                                             return_intermediate=True)
 
             hashed_data = self.compile_message(biom=others_bit, msg=msg_bits)
@@ -421,15 +463,16 @@ class BiomBinder_IoMaxGRP():
             scr_r = cosine_sim(anchor_vec, others_vec)
             rbiom_scores.extend(scr_r.cpu().tolist())
 
+            scr_nr = cosine_sim(anc_norm, oth_norm)
+            nrbiom_scores.extend(scr_nr.cpu().tolist())
+
             scr_br = cosine_sim(anc_bias, oth_bias)
             brbiom_scores.extend(scr_br.cpu().tolist())
 
             scr_pr = cosine_sim(anc_proj, oth_proj).view(-1)
             prbiom_scores.extend(scr_pr.cpu().tolist())
 
-        return msg_scores, biom_scores, rbiom_scores, brbiom_scores, prbiom_scores
-
-
+        return msg_scores, biom_scores, rbiom_scores, nrbiom_scores, brbiom_scores, prbiom_scores
 
 
 
@@ -459,7 +502,7 @@ def binding_debugger():
 
     biom_size = 512
     msg_size = biom_size // 3
-    binder = BiomBinder_IoMaxGRP(biom_size=biom_size, msg_size=msg_size)
+    binder = BiomBinder_Method(biom_size=biom_size, msg_size=msg_size)
 
     bits = np.random.randint(0, 2, size=msg_size, dtype=np.int32)
     biom = np.random.randint(0, 2, size=biom_size, dtype=np.int32)
@@ -474,83 +517,172 @@ def binding_debugger():
 
 
 
+LMBDA_DICT = dict(
+    # ### adair_cfp_thresh @ 0.397,
+    # adair_cfp_S_14   = 2.30994,
+    # adair_cfp_S_15   = 2.12895,
+    # adair_cfp_T_08   = 4.26538,
+    # adair_cfp_T_09   = 3.76649,
+    # ### adair_lfw_thresh @ 0.347,
+    # adair_lfw_S_14   = 2.42099,
+    # adair_lfw_S_15   = 2.23409,
+    # adair_lfw_T_08   = 4.44803,
+    # adair_lfw_T_09   = 3.93010,
+    # ### adair_pie_thresh @ 0.376,
+    # adair_pie_S_14   = 2.35721,
+    # adair_pie_S_15   = 2.17373,
+    # adair_pie_T_08   = 4.34303,
+    # adair_pie_T_09   = 3.83606,
+
+    ### arcir_cfp_thresh @ 0.366,
+    # arcir_cfp_S_14   = 2.37940,
+    # arcir_cfp_S_15   = 2.19473,
+    # arcir_cfp_T_08   = 4.37952,
+    # arcir_cfp_T_09   = 3.86875,
+    # ### arcir_lfw_thresh @ 0.373,
+    # arcir_lfw_S_14   = 2.36389,
+    # arcir_lfw_S_15   = 2.18005,
+    # arcir_lfw_T_08   = 4.35401,
+    # arcir_lfw_T_09   = 3.84589,
+    # ### arcir_pie_thresh @ 0.399,
+    # arcir_pie_S_14   = 2.30538,
+    # arcir_pie_S_15   = 2.12463,
+    # arcir_pie_T_08   = 4.25791,
+    # arcir_pie_T_09   = 3.75980,
+
+    ### kprpe_cfp_thresh @ 0.328,
+    # kprpe_cfp_S_14   = 2.46187,
+    # kprpe_cfp_S_15   = 2.27277,
+    # kprpe_cfp_T_08   = 4.51550,
+    # kprpe_cfp_T_09   = 3.99052,
+    # ### kprpe_lfw_thresh @ 0.387,
+    # kprpe_lfw_S_14   = 2.33257,
+    # kprpe_lfw_S_15   = 2.15039,
+    # kprpe_lfw_T_08   = 4.30253,
+    # kprpe_lfw_T_09   = 3.79978,
+    # ###  kprpe_pie_thresh @ 0.455,
+    # kprpe_pie_S_14   = 2.17403,
+    # kprpe_pie_S_15   = 2.00007,
+    # kprpe_pie_T_08   = 4.04318,
+    # kprpe_pie_T_09   = 3.56732,
+)
+
+keys_mapper = {
+"adair": "cvl_adaface_features",
+"arcir": "cvl_arcface_features",
+"kprpe": "cvl_vitkprpe_features",
+"lfw"  : "lfw-a",
+"cfp"  : "cfp-frontal",
+"pie"  : "multipie",
+"S"    : 3,
+"T"    : 2,
+}
+
+
+
 if __name__ == "__main__":
     DEVICE = 'cuda'
 
-    ROOT_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/data_extracts/face_features/cfp-frontal/"
+    ROOT_PATH = ("/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/"
+                 f"datasets/data_extracts/face_features/")
 
-    SAVE_PATH = "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/HYPES/trials/e2/"
-    os.makedirs(SAVE_PATH, exist_ok=True)
-
+    SAVE_PATH = ("/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/"
+                 f"HYPES/ExperSET2/")
 
     model_filter = {
-    # "clip_features"    : "Clip Zero-Shot ViT-B",
-    # "farl_features"    : "FARL Zero-Shot ViT-B",
-    # "cvl_arcface_features" : "ArcFace IResNet-101",
-    "cvl_adaface_features" : "AdaFace IResNet-101",
-    # "dino_features"        : "Dino Zero-shot",
-    # "arcface_features"     : "IR50 Arc Face",
-    }
+        "cvl_adaface_features" : "AdaFace IResNet-101",
+        "cvl_arcface_features" : "ArcFace IResNet-101",
+        "cvl_vitkprpe_features"  : "KPRPE-AdaFace ViT-base",
+        }
 
-    modelrep_dict = read_modelwise_biometrics(ROOT_PATH, DEVICE)
+    print(LMBDA_DICT.keys())
+    for ld in LMBDA_DICT.keys():
 
+        mk = keys_mapper[ld.split("_")[0]]
+        dk = keys_mapper[ld.split("_")[1]]
+        rv = keys_mapper[ld.split("_")[2]] # 2 or 3
+        lv = LMBDA_DICT[ld]
 
-    repeat_rate = 1
-    biom_enc_bits = 1
-    msg_size = 2048
-    biom_size = msg_size*3
+        genuine_1vsrest = False
+        imposter_max    = 10
 
-    binder = BiomBinder_IoMaxGRP(biom_size=biom_size, msg_size=msg_size, device=DEVICE)
+        read_full_path = os.path.join(ROOT_PATH, f"{dk}")
 
-    msg_bits = torch.randint(0, 2, (msg_size,), dtype=torch.int).to(DEVICE)
+        for bc in [4096]:
 
-
-    msg_matching_dict = {}
-    rbiom_matching_dict = {}
-
-    for fk in model_filter.keys():
-        print(fk)
-        vec_dict = modelrep_dict[fk][1]
-
-        VEC_IN = modelrep_dict[fk][0]
-
-        vec , vec_dict = vectors_loader(os.path.join(ROOT_PATH, "image_filenames.txt"),
-                            vectors=VEC_IN)
-
-        # ### REMOVE : debug
-        # sample_keys = random.sample(list(vec_dict.keys()), min(10, len(vec_dict)))
-        # sub_dict = {k: vec_dict[k] for k in sample_keys}
-        # vec_dict = sub_dict
-        # #### remove
-
-        ## sequential computation
-        (gen_msg_err, gen_biom_sim, gen_rbiom_sim, gen_brbiom_sim, gen_prbiom_sim
-                            ) = binder.genuine_extraction(vec_dict, msg_bits)
-        (imp_msg_err, imp_biom_sim, imp_rbiom_sim, imp_brbiom_sim, imp_prbiom_sim
-                            ) = binder.imposter_extraction(vec_dict, msg_bits)
-
-        ## store stuff
-        msg_matching_dict[fk] = [gen_msg_err, imp_msg_err]
-
-        rbiom_matching_dict[f"{fk}--raw"] = [gen_rbiom_sim, imp_rbiom_sim]
-        rbiom_matching_dict[f"{fk}--bias"] = [gen_brbiom_sim, imp_brbiom_sim]
-        rbiom_matching_dict[f"{fk}--proj"] = [gen_prbiom_sim, imp_prbiom_sim]
-        rbiom_matching_dict[f"{fk}--binary"] = [gen_biom_sim, imp_biom_sim]
+            msg_bit_size  = bc # [256, 512, 1024, 2048, 4096, 6144]:
+            biom_bit_size = msg_bit_size*rv
 
 
-        dump_dict = {fk: msg_matching_dict[fk]}
-        with open(os.path.join(SAVE_PATH, f"{fk}-message_match_error_sum.pkl"), "wb") as f:
-            pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+            ## ----------------
+            save_path_full = os.path.join(SAVE_PATH, f"{dk}", f"{ld}" ,f"{bc}-bits")
+            os.makedirs(save_path_full, exist_ok=False)
+            print(save_path_full)
 
-        dump_dict = {k:v for k,v in rbiom_matching_dict.items() if fk in k}
-        with open(os.path.join(SAVE_PATH, f"{fk}-biom_analysis.pkl"), "wb") as f:
-            pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+            # Load vectors
+            modelrep_dict = read_modelwise_biometrics(read_full_path, DEVICE)
 
-        # with open("data.pkl", "rb") as f: loaded_from_disk = pickle.load(f)
+            # Load Binder class
+            binder = BiomBinder_Method(biom_bit_size=biom_bit_size, msg_bit_size=msg_bit_size,
+                                        lmbda=lv,
+                                        rate_denom=rv,
+                                        genuine_1VSrest=genuine_1vsrest,
+                                        imposter_max = imposter_max,
+                                        device=DEVICE)
+            # message bits
+            msg_bits = torch.randint(0, 2, (msg_bit_size,), dtype=torch.int).to(DEVICE)
 
 
-        plot_score_hist_grid(msg_matching_dict, title = f"Retrived Message Error", cols=1,
-                save_path=os.path.join(SAVE_PATH,"binded-msg-recovery-sum.png"))
+            msg_matching_dict = {}
+            rbiom_matching_dict = {}
 
-        plot_score_hist_grid(rbiom_matching_dict, title = f"Biometrics Similarity for Step-Wise", cols=4,
-            save_path=os.path.join(SAVE_PATH,"biometric-similarities.png"))
+            # vec_dict = modelrep_dict[mk][1]
+            print(mk)
+
+            VEC_IN = modelrep_dict[mk][0]
+
+            vec , vec_dict = vectors_loader(os.path.join(read_full_path, "image_filenames.txt"),
+                                vectors=VEC_IN)
+
+            # ### REMOVE : debug
+            # sample_keys = random.sample(list(vec_dict.keys()), min(10, len(vec_dict)))
+            # sub_dict = {k: vec_dict[k] for k in sample_keys}
+            # vec_dict = sub_dict
+            # #### remove
+
+            ## sequential computation
+            (imp_msg_err, imp_biom_sim, imp_rbiom_sim,
+                imp_nrbiom_sim, imp_brbiom_sim, imp_prbiom_sim
+                                ) = binder.imposter_extraction(vec_dict, msg_bits)
+            (gen_msg_err, gen_biom_sim, gen_rbiom_sim,
+                gen_nrbiom_sim, gen_brbiom_sim, gen_prbiom_sim
+                                ) = binder.genuine_extraction(vec_dict, msg_bits)
+
+
+            ## store stuff
+            msg_matching_dict[mk] = [gen_msg_err, imp_msg_err]
+
+            rbiom_matching_dict[f"{mk}--raw"] = [gen_rbiom_sim, imp_rbiom_sim]
+            rbiom_matching_dict[f"{mk}--norm"] = [gen_nrbiom_sim, imp_nrbiom_sim]
+            rbiom_matching_dict[f"{mk}--bias"] = [gen_brbiom_sim, imp_brbiom_sim]
+            rbiom_matching_dict[f"{mk}--proj"] = [gen_prbiom_sim, imp_prbiom_sim]
+            rbiom_matching_dict[f"{mk}--binary"] = [gen_biom_sim, imp_biom_sim]
+
+
+            dump_dict = {mk: msg_matching_dict[mk]}
+            with open(os.path.join(save_path_full, f"{mk}-message_match_error_sum.pkl"), "wb") as f:
+                pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            dump_dict = {k:v for k,v in rbiom_matching_dict.items() if mk in k}
+            with open(os.path.join(save_path_full, f"{mk}-biom_analysis.pkl"), "wb") as f:
+                pickle.dump(dump_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            # with open("data.pkl", "rb") as f: loaded_from_disk = pickle.load(f)
+
+            plot_score_hist_grid(msg_matching_dict, title = f"Retrived Message Error {bc}-Bits", cols=1,
+                    save_path=os.path.join(save_path_full,"binded-msg-recovery-sum.png"),
+                    enable_err_metrics=True)
+
+            plot_score_hist_grid(rbiom_matching_dict, title = f"Biometrics Similarity for Step-Wise {bc}-Bits", cols=4,
+                save_path=os.path.join(save_path_full,"biometric-similarities.png"),
+                enable_roc_metrics=True)
