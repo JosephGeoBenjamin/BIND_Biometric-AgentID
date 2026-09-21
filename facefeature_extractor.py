@@ -1,13 +1,16 @@
-"""Extract feature embeddings for every image in a real dataset.
+"""Extract feature embeddings for every image in an aligned face dataset.
 
-Supported feature spaces: CLIP, FaRL, DINO, ArcFace.
-Results are saved under ``datasets/features/<dataset>/``.
+Supported feature spaces: AdaFace, ArcFace, KPRPE-AdaFace (CVLface), CLIP, DINO.
+Results are saved under ``<output-root>/<dataset>/`` as one ``.pt`` matrix per
+model plus ``image_filenames.txt``, row-aligned to the matrices.
 
 Usage
 -----
-    python extract_features.py \\
-        --dataset sample_IJB-C \\
+    python facefeature_extractor.py \\
+        --dataset lfw-a \\
+        --output-root /path/to/face_features/ \\
         --batch-size 128 \\
+        --use-adaface-cvl \\
         --cuda --verbose
 """
 
@@ -25,7 +28,6 @@ from PIL import Image
 # from lib import DATASETS, FARL_PRETRAIN_MODEL, VGGFace2
 
 import cvlface_loader as cvlface
-import lafs_loader as lafs_fr
 
 
 DATASETS = {
@@ -98,7 +100,7 @@ class VGGFaceDataset(data.Dataset):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Extract CLIP/FaRL/DINO/ArcFace features for a real dataset.')
+        description='Extract face recognition features for an aligned dataset.')
 
     p.add_argument('-v', '--verbose',  action='store_true')
     p.add_argument('--dataset',        type=str, required=True,
@@ -109,7 +111,6 @@ def parse_args():
 
     p.add_argument('--use-clip',            action='store_true')
     p.add_argument('--use-dino',            action='store_true')
-    p.add_argument('--use-lafs',            action='store_true')
 
     p.add_argument('--use-arcface-cvl',     action='store_true')
     p.add_argument('--use-adaface-cvl',     action='store_true')
@@ -146,7 +147,7 @@ def main():
 
 
     # ── build models ──────────────────────────────────────────────────────────
-    clip_model   = dino_model = lafs_model = None
+    clip_model   = dino_model = None
     cvl_arcface_model  =  cvl_adaface_model  =  cvl_vitkprpe_model = None
 
 
@@ -166,12 +167,6 @@ def main():
             transforms.Resize(224), transforms.CenterCrop(224),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
-
-    if args.use_lafs:
-        lafs_repo  = "pretrained/lafs_webface_finetune_withaugmentation.pth"
-        lafs_model = lafs_fr.load_lafs_model(lafs_repo).to(device)
-        lafs_model.float().eval().to(device)
-        lafs_tf    = lafs_fr.get_lafs_transform(input_size=112, tensorize=False)
 
 
     ## CVLface
@@ -207,7 +202,6 @@ def main():
     filenames     = []
     clip_feats    = []
     dino_feats    = []
-    lafs_feats    = []
 
     cvl_arcface_feats  = []
     cvl_adaface_feats  = []
@@ -226,8 +220,6 @@ def main():
                 clip_feats.append(clip_model.encode_image(clip_tf(imgs)).cpu())
             if dino_model:
                 dino_feats.append(dino_model(dino_tf(imgs)).cpu())
-            if lafs_model:
-                lafs_feats.append(lafs_model(lafs_tf(imgs)).cpu())
 
             if cvl_arcface_model:
                 cvl_arcface_feats.append(cvl_arcface_model(cvl_arcface_tf(imgs)).cpu())
@@ -251,7 +243,6 @@ def main():
 
     _save(clip_feats,    'clip_features.pt')
     _save(dino_feats,    'dino_features.pt')
-    _save(lafs_feats,    'lafs_features.pt')
 
     _save(cvl_arcface_feats,  'cvl_arcface_features.pt')
     _save(cvl_adaface_feats,  'cvl_adaface_features.pt')
