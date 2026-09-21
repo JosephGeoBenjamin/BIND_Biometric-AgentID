@@ -4,6 +4,8 @@
 
 > **Joseph Geo Benjamin, Anil K. Jain, Karthik Nandakumar**
 
+Accepted at the IEEE/IAPR International Joint Conference on Biometrics (IJCB) Sessions 2026
+
 Reference implementation of the **BIND** framework.
 
 ---
@@ -32,6 +34,10 @@ based on turbo error correcting codes. Experiments demonstrate the practical
 feasibility of the proposed face cryptosystem, achieving a True Match Rate of
 96% at zero False Match Rate and supporting 1024-bit agent tokens.
 
+### Framework
+
+![BIND framework block diagram](https://github.com/JosephGeoBenjamin/BIND_Biometric-AgentID/releases/download/v0.1/flow-diagram.png)
+
 ---
 
 ## Pipeline
@@ -56,6 +62,11 @@ images ──► align ──► extract features ──► bind token ──►
 
 CVLface models are fetched on first use and cached under `CACHE_DIR` in
 `cvlface_loader.py`.
+
+### Notebooks
+
+Analysis notebooks and supplementary code are published with the
+[v0.1 release](https://github.com/JosephGeoBenjamin/BIND_Biometric-AgentID/releases/tag/v0.1).
 
 ---
 
