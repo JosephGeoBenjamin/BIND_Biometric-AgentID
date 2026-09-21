@@ -1,3 +1,5 @@
+# pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+
 numpy
 Pillow
 opencv-python-headless
@@ -5,18 +7,24 @@ scikit-learn
 scikit-image
 scipy
 tqdm
+sionna-no-rt
+
 matplotlib
-lpips
 ipython
 ipykernel
 ipywidgets
 urllib3
 requests
 ninja
+omegaconf
+
+huggingface
+huggingface-hub
+timm
+transformers
+lpips
 clip @ git+https://github.com/openai/CLIP.git
 face-alignment
 
+# mediapipe==0.10.14 # Only use this; but why??
 
-# torch>=1.12.0
-# torchvision>=0.13.0
-# mediapipe==0.10.14 # Only use this

@@ -25,10 +25,16 @@ FaceAnonyMixer generates privacy-preserving face images by **mixing a real face'
 | **Irreversibility** | Original identity cannot be recovered even if the key and template are both known |
 | **Performance Preservation** | Recognition accuracy on protected faces matches unprotected baselines |
 
+> **Note** — this is a vendored copy of the upstream FaceAnonyMixer release,
+> adapted for use inside the Bind-AgentID project. Dataset roots point at local
+> paths, a face-pose filtering stage has been added, and the pipeline is driven
+> by `run_pipelines.sh`. See the parent `../README.md` for how the protected
+> images feed back into the binding protocol.
+
 ## Repository Structure
 
 ```
-faceanonymixer/
+FaceAnonyMixer/
 │
 ├── anonymize.py              # Core: latent mixing + multi-loss optimization
 ├── invert.py                 # GAN inversion via e4e + Pivot Tuning
@@ -36,8 +42,8 @@ faceanonymixer/
 ├── extract_features.py       # Extract CLIP/FaRL/DINO/ArcFace features for real images
 ├── pair_unique.py            # Pair each real identity to a unique fake identity ← use this
 ├── pair_nn.py                # Random per-image pairing (ablation only)
-├── visualize.py              # Grid visualization
 ├── download_pretrained.py    # Download all pretrained weights
+├── run_pipelines.sh          # End-to-end pipeline invocations
 │
 ├── lib/
 │   ├── __init__.py
@@ -51,30 +57,27 @@ faceanonymixer/
 │   ├── augmentations.py      # ImageAugmenter
 │   ├── aligner.py            # Face alignment (face_alignment library)
 │   ├── arcface.py            # ArcFace feature extractor
+│   ├── facepose.py           # MediaPipe frontal-pose filter (CLI)
 │   ├── collate_fn.py         # DataLoader collate helper
 │   └── aux.py                # tensor2image, anon_exp_dir, DataParallelPassthrough
 │
 ├── models/
-│   ├── __init__.py
 │   ├── load_generator.py     # Build + load StyleGAN2 from GenForce
 │   ├── psp.py                # e4e / pSp encoder wrapper
-│   └── encoders/
-│       ├── __init__.py
-│       ├── helpers.py        # Shared IR bottleneck blocks
-│       └── psp_encoders.py   # GradualStyleEncoder, Encoder4Editing
-│
-├── models/genforce/          # Populated by scripts/setup_genforce.sh
+│   ├── encoders/
+│   │   ├── helpers.py        # Shared IR bottleneck blocks
+│   │   ├── model_irse.py     # IR-SE backbone
+│   │   └── psp_encoders.py   # GradualStyleEncoder, Encoder4Editing
+│   ├── stylegan2/            # StyleGAN2 ops (incl. CUDA extensions under op/)
+│   ├── genforce/             # GenForce model definitions
+│   └── pretrained/           # Downloaded weights (e4e, farl, sfd, genforce)
 │
 ├── utils1/
 │   ├── __init__.py
 │   ├── ImagesDataset.py      # Simple flat image dataset
 │   └── data_utils.py         # make_dataset helper
 │
-├── scripts/
-│   └── setup_genforce.sh     # Clone GenForce into models/genforce/
-│
-├── requirements.txt
-├── LICENSE
+├── datasets/                 # Pipeline outputs (inv, features, fake, anonymised)
 └── README.md
 ```
 
@@ -82,27 +85,36 @@ faceanonymixer/
 
 ## Installation
 
+Dependencies are installed from the parent project's `../requirements.txt`,
+which covers this pipeline as well as the binding protocol.
+
 ```bash
-# 1. Clone this repository
-git clone https://github.com/talha-alam/faceanonymixer.git
-cd faceanonymixer
+# 1. Install Python dependencies (from the parent directory)
+pip install -r ../requirements.txt
 
-# 2. Install Python dependencies
-pip install -r requirements.txt
-
-# 3. Set up the GenForce model definitions
-bash scripts/setup_genforce.sh
-
-# 4. Download all pretrained weights
-#    (StyleGAN2-FFHQ-1024, e4e, ArcFace, FaRL ep64, SFD detector)
+# 2. Download pretrained weights
+#    (StyleGAN2-FFHQ-1024/512, e4e, ArcFace, FaRL ep16+ep64, SFD detector)
 python download_pretrained.py
+```
+
+Weights land under `models/pretrained/`, and the GenForce model definitions are
+already vendored under `models/genforce/`.
+
+`lib/facepose.py` uses MediaPipe. The parent `requirements.txt` notes
+`mediapipe==0.10.14` as the working version for this stage.
+
+Set `PYTHONPATH` to this directory before running any script, as
+`run_pipelines.sh` does:
+
+```bash
+export PYTHONPATH="/path/to/Bind-AgentID/FaceAnonyMixer/:$PYTHONPATH"
 ```
 
 ---
 
 ## Dataset Preparation
 
-Both CelebA-HQ and VGGFace2 must be organised as **one sub-folder per identity**:
+Datasets must be organised as **one sub-folder per identity**:
 
 ```
 /path/to/dataset/
@@ -114,84 +126,120 @@ Both CelebA-HQ and VGGFace2 must be organised as **one sub-folder per identity**
         └── 0001.jpg
 ```
 
-Edit `lib/config.py` to point to your local paths:
+Edit `DATASETS` in `lib/config.py` to point to your local paths. The keys
+defined there are the values accepted by every script's `--dataset` flag:
 
 ```python
 DATASETS = {
-    'celebahq': '/path/to/your/dataset',
+    'celebahq':       '/path/to/CelebA-HQ-images/',
+    'celebahq-front': '/path/to/CelebA-HQ-frontal',
+    'celebahq-trial': '/path/to/SubSet-for-test/',
 }
 ```
+
+`celebahq-trial` is a small subset useful for verifying the pipeline end to end
+before committing to a full run.
 
 ---
 
 ## Step-by-Step Usage
+
+`run_pipelines.sh` holds the full sequence with working arguments. The steps
+below mirror it.
 
 ### Step 1 — GAN Inversion
 
 Project real faces into W+ space using e4e + Pivot Tuning Inversion.
 
 ```bash
-python invert.py \
-    --dataset celebahq \
-    --num-steps 150 \
-    --learning-rate 0.0005 \
+CUDA_VISIBLE_DEVICES=0 python invert.py \
+    --dataset celebahq-front \
+    --batch-size 1 \
+    --save-reconstructed-images \
+    --save-aligned-images \
     --cuda --verbose
 ```
 
-Output: `datasets/inv_pivot/celebahq/{aligned,reconstructed,latents}/`
+Output: `datasets/inv/<dataset>/`, alongside `alignment_errors.txt` and
+`face_detection_errors.txt` listing any images that could not be processed.
 
 ---
 
-### Step 2 — Generate Fake Dataset
-
-Sample a pool of synthetic faces with feature embeddings.
+### Step 2 — Extract Real Dataset Features
 
 ```bash
-python create_fake_dataset.py \
-    --gan stylegan2_ffhq1024 \
-    --num-samples 60000 \
-    --truncation 0.7 \
-    --cuda --verbose
-```
-
-Output: `datasets/fake/fake_dataset_stylegan2_ffhq1024-0.7-60000-CLIP-FaRL-DINO-ArcFace/`
-
----
-
-### Step 3 — Extract Real Dataset Features
-
-```bash
-python extract_features.py \
-    --dataset celebahq \
+CUDA_VISIBLE_DEVICES=0 python extract_features.py \
+    --dataset celebahq-front \
     --batch-size 128 \
     --cuda --verbose
 ```
 
-Output: `datasets/features/celebahq/`
+Output: `datasets/features/<dataset>/` — one `.pt` per feature space
+(`clip`, `farl`, `dino`, `arcface`) plus `image_filenames.txt`.
+
+Individual feature spaces can be skipped with `--no-clip`, `--no-farl`,
+`--no-dino`, or `--no-arcface`.
 
 ---
 
-### Step 4 — Pair Identities
+### Step 3 — Generate Fake Dataset
 
-Assign each real identity a unique fake identity (same fake latent = the revocable key).
+Sample a pool of synthetic faces with matching feature embeddings.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python create_fake_dataset.py \
+    --gan stylegan2_ffhq1024 \
+    --num-samples 1000 \
+    --truncation 0.7 \
+    --cuda --verbose
+```
+
+Output: `datasets/fake/fake_dataset_stylegan2_ffhq1024/` — one directory per
+sample, keyed by latent-code hash, each holding `image.jpg`, `latent_code_w+.pt`,
+`latent_code_s.pt`, and the four feature tensors.
+
+---
+
+### Step 4 — Filter by Pose
+
+Keep only near-frontal synthetic faces, so the key identities are well posed.
+
+```bash
+python lib/facepose.py \
+    --inp "datasets/fake/fake_dataset_stylegan2_ffhq1024/*/*.jpg" \
+    --out datasets/fake/Fake_Filtered/
+```
+
+Output: `datasets/fake/Fake_Filtered/` carrying forward the same per-sample
+directory layout. Quote the `--inp` glob so the shell passes it through intact.
+
+---
+
+### Step 5 — Pair Identities
+
+Assign each real identity a unique fake identity. The paired fake latent is the
+revocable key — changing it revokes and replaces the protected template.
 
 ```bash
 python pair_unique.py \
-    --real-dataset celebahq \
-    --fake-dataset-root datasets/fake/fake_dataset_stylegan2_ffhq1024-0.7-60000-CLIP-FaRL-DINO-ArcFace \
+    --real-dataset celebahq-front \
+    --fake-dataset-root datasets/fake/Fake_Filtered \
     --verbose
 ```
 
-Output: `random_nn_map_celebahq.json` inside the fake dataset directory.
+Output: `random_nn_map_<dataset>.json` inside the fake dataset directory.
+`--seed` (default 42) makes the assignment reproducible.
+
+`pair_nn.py` offers random per-image pairing instead, for ablation only.
 
 ---
 
-### Step 5 — Anonymize
+### Step 6 — Anonymize
 
 ```bash
-python anonymize.py \
-    --dataset celebahq \
-    --fake-nn-map datasets/fake/fake_dataset_stylegan2_ffhq1024-0.7-60000-CLIP-FaRL-DINO-ArcFace/random_nn_map_celebahq.json \
+CUDA_VISIBLE_DEVICES=0 python anonymize.py \
+    --dataset celebahq-front \
+    --fake-nn-map datasets/fake/Fake_Filtered/random_nn_map_celebahq-front.json \
     --latent-space W+ \
     --epochs 50 \
     --lr 0.01 \
@@ -204,25 +252,16 @@ python anonymize.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--epochs` | 50 | Optimisation steps per identity group |
+| `--lr` | 0.01 | Learning rate |
+| `--optim` | adam | Optimiser |
 | `--lambda-id` | 10.0 | Weight for `L_anon` |
 | `--lambda-attr` | 0.15 | Weight for `L_attr` |
 | `--lambda-consistency` | 10.0 | Weight for `L_idp` |
 | `--id-margin` | 0.0 | Cosine margin in `L_anon` (0 = max anonymisation) |
+| `--latent-space` | W+ | Latent space used for mixing |
 
-Output: `experiments/<hash>/{data,latent_codes}/<identity>/`
-
----
-
-### Visualization (optional)
-
-```bash
-python visualize.py \
-    --dataset celebahq \
-    --fake-nn-map datasets/fake/.../random_nn_map_celebahq.json \
-    --inv \
-    --anon experiments/<hash> \
-    --batch-size 4 --save --verbose
-```
+Output: `datasets/anonymised/<dataset>/`, with an `args.json` recording the
+settings used for the run.
 
 ## Citation
 
@@ -245,4 +284,6 @@ Built on [FALCO](https://github.com/chi0tzp/FALCO) · GAN inversion via [e4e](ht
 
 ## License
 
-[MIT License](LICENSE)
+MIT License, per the [upstream release](https://github.com/talha-alam/faceanonymixer).
+The vendored GenForce components under `models/genforce/` carry their own
+licence in `models/genforce/LICENSE`.

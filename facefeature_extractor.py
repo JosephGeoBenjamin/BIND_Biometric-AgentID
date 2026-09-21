@@ -29,7 +29,12 @@ import lafs_loader as lafs_fr
 
 
 DATASETS = {
-    "cfp-frontal" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CFP-frontal/"
+    "cfp-frontal" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CFP-frontal/",
+    "lfw-a" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/LFW-a-set/",
+    "multipie" : "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/Multi_PIE/",
+    "celeba-hq": "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CelebA-HQ-set/",
+    "celeba-hq-frontal": "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CelebA-HQ-frontal/",
+    "casia-face": "/egr/research-sprintai/benja161/BioMetron/agentic_idOBO/datasets/imagesets/CASIA-webface/"
 }
 
 class VGGFaceDataset(data.Dataset):
@@ -108,7 +113,7 @@ def parse_args():
 
     p.add_argument('--use-arcface-cvl',     action='store_true')
     p.add_argument('--use-adaface-cvl',     action='store_true')
-    # p.add_argument('--no-vitkprpe-cvl',     action='store_true')
+    p.add_argument('--use-vitkprpe-cvl',     action='store_true')
 
     p.add_argument('--cuda',           dest='cuda', action='store_true')
 
@@ -182,11 +187,14 @@ def main():
         cvl_adaface_model.float().eval().to(device)
         cvl_adaface_tf    = cvlface.get_cvlface_transform(input_size=112, tensorize=False)
 
-    # if not args.no_vitkprpe_cvl:
-    #     cvl_vitkprpe_repo  = "minchul/cvlface_adaface_vit_base_kprpe_webface4m"
-    #     cvl_vitkprpe_model = cvlface.load_cvlface_model(cvl_vitkprpe_repo).to(device)
-    #     cvl_vitkprpe_model.float().eval().to(device)
-    #     cvl_vitkprpe_tf    = cvlface.get_cvlface_transform(input_size=112, tensorize=False)
+    if args.use_vitkprpe_cvl:
+        cvl_vitkprpe_repo  = "minchul/cvlface_adaface_vit_base_kprpe_webface4m"
+        cvl_aligner_repo   = "minchul/cvlface_DFA_mobilenet"
+        cvl_vitkprpe_model = cvlface.KPRPEExtractor(cvl_vitkprpe_repo,
+                                                    cvl_aligner_repo,
+                                                    device=device)
+        cvl_vitkprpe_model.float().eval().to(device)
+        cvl_vitkprpe_tf    = cvlface.get_cvlface_transform(input_size=112, tensorize=False)
 
 
 
@@ -225,8 +233,8 @@ def main():
                 cvl_arcface_feats.append(cvl_arcface_model(cvl_arcface_tf(imgs)).cpu())
             if cvl_adaface_model:
                 cvl_adaface_feats.append(cvl_adaface_model(cvl_adaface_tf(imgs)).cpu())
-            # if cvl_vitkprpe_model:
-            #     cvl_vitkprpe_feats.append(cvl_vitkprpe_model(cvl_vitkprpe_tf(imgs)).cpu())
+            if cvl_vitkprpe_model:
+                cvl_vitkprpe_feats.append(cvl_vitkprpe_model(cvl_vitkprpe_tf(imgs)).cpu())
 
 
     # ── save ──────────────────────────────────────────────────────────────────

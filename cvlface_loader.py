@@ -7,11 +7,11 @@ No CVLface repo install needed.
 import os, sys, shutil, torch
 from huggingface_hub import hf_hub_download
 from transformers import AutoModel
-# from torchvision.transforms import Compose, ToTensor, Normalize
 from torchvision import transforms as tv_transforms
 
 from PIL import Image
 
+CACHE_DIR = "/egr/research-sprintai/benja161/.cache/cvlface_cache/"
 
 # ── Download helpers ─────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ def _load_from_local(local_path: str, hf_token: str | None = None):
 
 def load_cvlface_model(
     repo_id: str,
-    cache_dir: str = "/egr/research-sprintai/benja161/.cache/cvlface_cache/",
+    cache_dir: str = CACHE_DIR,
     hf_token: str | None = None,
     force_download: bool = False,
 ) -> torch.nn.Module:
@@ -81,7 +81,7 @@ def load_cvlface_model(
 
 def load_aligner(
     aligner_id: str = "minchul/cvlface_DFA_mobilenet",
-    cache_dir: str = "/egr/research-sprintai/benja161/.cache/cvlface_cache/",
+    cache_dir: str = CACHE_DIR,
     hf_token: str | None = None,
     force_download: bool = False,
 ):
@@ -151,66 +151,102 @@ def get_cvlface_transform(input_size=None, tensorize=True):
     return tv_transforms.Compose(ops)
 
 
+##=============================================================================
+# ── ViTKPRPE feature extractor ────────────────────────────────────────────────
+#
+# Wraps the recognition model + DFA aligner into one callable object.
+#
+# Usage pattern (see extract_features.py):
+#
+#   extractor = KPRPEExtractor(device=device)
+#   feats = extractor(imgs)          # imgs: (B,3,112,112) float [0,1] tensor
+##=============================================================================
+
+# Fallback canonical 5-point landmarks for a 112×112 arcface-aligned crop,
+# used when the aligner fails to detect a face in a given image.
+_CANONICAL_KPS = torch.tensor([
+    [38.2946, 51.6963],   # left eye
+    [73.5318, 51.5014],   # right eye
+    [56.0252, 71.7366],   # nose tip
+    [41.5493, 92.3655],   # left mouth corner
+    [70.7299, 92.2041],   # right mouth corner
+], dtype=torch.float32)   # (5, 2)
 
 
-##==============================================================================
+class KPRPEExtractor(torch.nn.Module):
+    """
+    Self-contained extractor for the CVLface ViT-KPRPE recognition model.
 
-## Untested TODO: check this
-# ── Setup landmark detector (ViTKPRPE) ───────────────────────────────────────
+    Bundles the DFA aligner (for landmark detection on already-aligned 112×112
+    crops) and the KPRPE recognition model into one callable.  Landmarks that
+    the aligner fails to detect fall back to canonical positions.
 
-# import insightface
+    Args:
+        recognition_id : HuggingFace repo for the KPRPE recognition model.
+        aligner_id     : HuggingFace repo for the DFA landmark aligner.
+        cache_dir      : local model cache root.
+        hf_token       : optional HuggingFace token.
+        device         : 'cuda' or 'cpu'.
 
-# detector = insightface.app.FaceAnalysis(allowed_modules=['detection'])
-# detector.prepare(ctx_id=0, det_size=(112, 112))  # ctx_id=0 for GPU, -1 for CPU
+    Example::
 
-# def get_keypoints(imgs_uint8_numpy: list[np.ndarray]) -> torch.Tensor:
-#     """
-#     Args:
-#         imgs_uint8_numpy: list of B numpy arrays, each (112, 112, 3) uint8 BGR
-#                           (insightface expects BGR, OpenCV format)
-#     Returns:
-#         keypoints: (B, 5, 2) float32 tensor  [x, y] per landmark
-#     """
-#     kps_batch = []
-#     for img in imgs_uint8_numpy:
-#         faces = detector.get(img)
-#         if len(faces) == 0 or faces[0].kps is None:
-#             # fallback: use canonical 112×112 landmark positions
-#             kps = torch.tensor([
-#                 [38.2946, 51.6963],   # left eye
-#                 [73.5318, 51.5014],   # right eye
-#                 [56.0252, 71.7366],   # nose tip
-#                 [41.5493, 92.3655],   # left mouth
-#                 [70.7299, 92.2041],   # right mouth
-#             ], dtype=torch.float32)
-#         else:
-#             kps = torch.from_numpy(faces[0].kps).float()   # (5, 2)
-#         kps_batch.append(kps)
-#     return torch.stack(kps_batch)   # (B, 5, 2)
+        extractor = KPRPEExtractor(device='cuda')
+        extractor.to('cuda')
 
+        # imgs: (B, 3, 112, 112) float32 in [0, 1]  (raw dataloader ToTensor output)
+        feats = extractor(imgs)   # → (B, D) on CPU
+    """
 
+    def __init__(
+        self,
+        recognition_id: str = "minchul/cvlface_adaface_vit_base_kprpe_webface4m",
+        aligner_id:     str = "minchul/cvlface_DFA_mobilenet",
+        cache_dir:      str = CACHE_DIR,
+        hf_token:       str | None = None,
+        device:         str = "cuda",
+    ):
+        super().__init__()
+        self.device    = device
 
+        print("Loading KPRPE recognition model …")
+        self.recognizer = load_cvlface_model(recognition_id, cache_dir, hf_token)
+        self.recognizer.eval().to(device)
 
-# ── In your dataloader loop ───────────────────────────────────────────────────
+        print("Loading DFA aligner …")
+        self.aligner = load_aligner(aligner_id, cache_dir, hf_token)
+        self.aligner.eval().to(device)
 
-# imgs      : (B, 3, 112, 112) float tensor on device, already normalized
-# imgs_path : list of image paths (or keep raw numpy around)
+    @torch.no_grad()
+    def get_keypoints(self, imgs_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Run the DFA aligner on a batch of normalised 112×112 crops and return
+        the detected landmarks.  Per-image fallback to canonical kps on failure.
 
-# Convert your normalized tensor back to uint8 BGR numpy for the detector
-# def tensor_to_bgr_numpy(imgs_tensor: torch.Tensor) -> list[np.ndarray]:
-#     """(B,3,112,112) float [-1,1] → list of (112,112,3) uint8 BGR"""
-#     imgs_np = ((imgs_tensor.cpu() * 0.5 + 0.5) * 255).byte().numpy()  # (B,3,H,W) uint8
-#     return [cv2.cvtColor(img.transpose(1, 2, 0), cv2.COLOR_RGB2BGR) for img in imgs_np]
+        Args:
+            imgs_norm : (B, 3, 112, 112) float32 in [-1, 1], on self.device.
 
+        Returns:
+            keypoints : (B, 5, 2) float32 on self.device.
+        """
+        _, orig_ldmks, _, scores, _, _ = self.aligner(imgs_norm)
+        # orig_ldmks: (B, 5, 2);  scores: (B,)
+        # Replace per-image keypoints where the aligner had low confidence.
+        canonical = _CANONICAL_KPS.unsqueeze(0).expand_as(orig_ldmks).to(self.device)
+        failed    = (scores < 0.5).view(-1, 1, 1).expand_as(orig_ldmks)
+        keypoints = torch.where(failed, canonical, orig_ldmks)
+        return keypoints
 
-# # Forward pass with keypoints
-# imgs_bgr = tensor_to_bgr_numpy(imgs)                        # list of numpy BGR
-# keypoints = get_keypoints(imgs_bgr).to(device)              # (B, 5, 2)
+    @torch.no_grad()
+    def forward(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        Extract KPRPE features for a batch of pre-aligned 112×112 images.
 
-# with torch.no_grad():
-#     feats = cvl_vitkprpe_model(
-#         cvl_vitkprpe_tf(imgs.to(device)),
-#         keypoints=keypoints                                  # ← this is what was missing
-#     ).cpu()
+        Args:
+            imgs : (B, 3, 112, 112) float32 in [0, 1]  (raw ToTensor output).
 
-# cvl_vitkprpe_feats.append(feats)
+        Returns:
+            (B, D) feature tensor on CPU.
+        """
+        keypoints = self.get_keypoints(imgs)              # (B,5,2)
+        feats     = self.recognizer(imgs, keypoints=keypoints)
+        return feats.cpu()

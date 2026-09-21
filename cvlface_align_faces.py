@@ -342,4 +342,11 @@ if __name__ == "__main__":
     )
 
 
+'''
+CLI example::
 
+CUDA_VISIBLE_DEVICES=0 python cvlface_align_faces.py \
+    --data-root /dataset-path/images/ \
+    --save-root /dataset-path/aligned/ \
+    --aligner-id minchul/cvlface_DFA_mobilenet
+'''
